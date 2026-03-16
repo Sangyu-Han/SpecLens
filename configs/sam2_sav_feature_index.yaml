@@ -1,0 +1,201 @@
+# =========================
+# Universal SAE Decile Index (Parquet-only)
+# =========================
+
+dataset:
+  # ---- 새로 추가: 레지스트리 경로 (교체 가능)
+  builder: src.packs.sam2.dataset.sa_v.builders:build_indexing_dataset        # (cfg, world_size, rank) -> (dataset, sampler)
+  collate_builder: src.packs.sam2.dataset.sa_v.repro_vosdataset:make_repro_collate
+
+  # ---- 네가 쓰던 값 그대로 유지
+  img_folder: /path/to/sav_frames_val/JPEGImages_sav
+  gt_folder: /path/to/SA-V-json-flat_val
+  # img_folder: /path/to/sa-v-data
+  # gt_folder: /path/to/sa-v-data
+  batch_size: 4
+  num_frames: 4
+  resize: 1024
+  max_num_objects: 3
+
+model:
+  name: sam2_hiera_t
+  yaml: configs/models/sam2.1_training/sam2.1_hiera_t.yaml
+  ckpt: checkpoints/models/sam2.1/sam2.1_hiera_tiny.pt
+  # ---- 새로 추가: 모델 로더 경로 (교체 가능)
+  loader: src.packs.sam2.models.model_loaders:load_sam2
+
+logging:
+  level: INFO
+  log_dir: outputs/logs
+  wandb:
+    enabled: true
+    mode: online
+    project: sam2-sae-index
+    entity: null  # Set your W&B entity
+    run_name: my-sae-run
+    group: sam2_sav_index_ra-batchtopk
+
+sae:
+  # ---- 새로 추가: SAE 팩토리 (교체 가능)
+  factory: src.core.sae.registry:create_sae
+
+  # ==== ra-batchtopk 학습 레이어 ====
+  layers:
+    - model.image_encoder.trunk@3
+    - model.image_encoder.trunk@0
+    - model.memory_attention.layers.3
+    - model.memory_encoder@vision_features
+    - model.sam_mask_decoder.transformer.layers.1@0
+    - model.sam_mask_decoder.transformer.layers.0@0
+    - model.sam_mask_decoder.transformer.layers.1@1
+    - model.sam_mask_decoder.transformer.layers.0@1
+  sae_type: ra-batchtopk                               # checkpoint에 sae_type 미기록 시 fallback
+  output:
+    save_path: /path/to/sae_checkpoints    # moved from /tmp
+
+  # (참고) 아래 training 블록은 인덱싱 단계에선 사용 안 함.
+  # 남겨둬도 무방하지만, 엄밀히는 제거 가능.
+
+# ---- store 설정은 main에서 store_cfg로 읽어가므로 키 이름만 바꿔줌
+store_cfg:
+  # ---- 새로 추가: 스토어 팩토리 (모델별/프레임워크별 교체 가능)
+  factory: src.packs.sam2.models.adapters:create_sam2eval_store
+
+  provenance:
+    enabled: true
+  sync:
+    mode: owner_stream
+  defaults:
+    batch_size: 8192
+    low: 4096
+    high: 131072
+    stride: 8
+    stride_start: 0
+
+  per_layer:
+    "model.image_encoder.trunk@3":
+      batch_size: 4096
+      high: 2_000_000
+      stride: 8
+      k: 32
+      k_aux: 256
+      l1_coeff: 2.0e-3
+      expansion_factor: 8
+
+    "model.memory_encoder@vision_features":
+      batch_size: 8192
+      high: 2_000_000
+      stride: 8
+      k: 32
+      k_aux: 256
+      l1_coeff: 2.0e-3
+      expansion_factor: 8
+
+    "model.memory_encoder@vision_pos_enc":
+      batch_size: 8192
+      high: 2_000_000
+      stride: 8
+      k: 32
+      k_aux: 256
+      l1_coeff: 2.0e-3
+      expansion_factor: 8
+
+    "model.obj_ptr_proj":
+      batch_size: 32
+      low: 1
+      high: 100_000
+      micro: 16
+      accum: 4
+      stride: 1
+      k: 16
+      k_aux: 32
+      expansion_factor: 32
+      l1_coeff: 5.0e-4
+
+    "model.sam_mask_decoder.transformer.layers.1@0":
+      batch_size: 128
+      high: 100_000
+      stride: 1
+      k: 16
+      k_aux: 32
+      expansion_factor: 32
+
+    "model.sam_mask_decoder.transformer.layers.0@1":
+      batch_size: 128
+      high: 100_000
+      stride: 1
+      k: 16
+      k_aux: 32
+      expansion_factor: 32
+
+    "model.sam_mask_decoder.transformer.layers.1@1":
+      batch_size: 8192
+      high: 2_000_000
+      stride: 16
+      k: 16
+      k_aux: 32
+      expansion_factor: 32
+
+    "model.memory_attention.layers.0":
+      batch_size: 8192
+      high: 2_000_000
+      stride: 8
+      k: 8
+      k_aux: 32
+      expansion_factor: 32
+
+    "model.memory_attention.layers.3":
+      batch_size: 8192
+      high: 2_000_000
+      stride: 8
+      k: 8
+      k_aux: 32
+      expansion_factor: 32
+
+  # (선택) 프롬프트 주입 정책 — 현재 store 구현에서 쓰면 그대로 두세요
+  prompts:
+    enable: true
+    out_dir: outputs/sae_index_ra-batchtopk_v2/.state/prompts
+    rows_per_shard: 200000
+    row_group_size: 8192
+    prompt_probability: 1.0
+    num_positive_points: 1
+    num_negative_points: 0
+    use_centroid: true
+
+offline_meta:
+  # SAM2-style offline meta ledger (samples + prompts with full BVD metadata)
+  ledger_class: src.packs.sam2.offline.offline_meta_ledger:OfflineMetaParquetLedger
+
+indexing:
+  # ---- Parquet-only 출력 루트
+  out_dir: outputs/sae_index_ra-batchtopk_v2
+  # 파티션 모듈러(전역). 생략 시 128로 동작. 저장해야 할 rows가 ~1e6 : 128.
+  partition_modulus: 128
+  # ---- 오프라인 메타(Ledger)가 저장될 루트 (samples/prompts)
+  offline_meta_root: outputs/sae_index_ra-batchtopk_v2/offline_meta
+
+  out_prefix: sam2_sav_tiny
+  seed: 12345
+
+  # ---- 인덱싱 모드
+  mode: topn                # "topn" (기본, 빠름) or "decile" (레거시)
+  top_n: 300                # mode=topn: feature당 저장할 상위 N개
+  track_frequency: true     # feature별 출현 빈도 추적 (topn 모드)
+
+  # ---- decile 파라미터 (mode=decile일 때만 사용)
+  num_deciles: 10
+  top_k_per_decile: 10
+  random_k_per_feature: 5
+  dedupe:
+    factory: src.packs.sam2.indexing.dedupe:by_sample_and_uid
+    fields: ["sample_id", "uid"]
+  boundary: max_range            # or "cutoffs"
+  # global_cutoffs: [ ... ]      # boundary=cutoffs일 때만
+
+  # ---- 체크포인트/진행 관리 (DDP에서 기존처럼 잘 동작)
+  checkpoint_dir: outputs/sae_index_ra-batchtopk_v2/.state
+  checkpoint_every_steps: 100
+
+  # (선택) 런 식별자
+  run_id: "sam2_run_sav"

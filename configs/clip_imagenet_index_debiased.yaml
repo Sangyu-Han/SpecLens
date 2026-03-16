@@ -1,0 +1,65 @@
+dataset:
+  builder: src.packs.clip.dataset.builders:build_indexing_dataset
+  collate_builder: src.packs.clip.dataset.builders:build_collate_fn
+  root: /path/to/imagenet
+  split: val
+  batch_size: 64
+  shuffle: false
+  drop_last: false
+  image_size: 224
+  interpolation: bicubic
+  mean: [0.48145466, 0.4578275, 0.40821073]
+  std: [0.26862954, 0.26130258, 0.27577711]
+
+model:
+  loader: src.packs.clip.train.factories:load_model
+  name: vit_base_patch16_clip_224
+  pretrained: true
+  dtype: float32
+
+sae:
+  factory: src.core.sae.registry:create_sae
+  sae_type: ra-batchtopk
+  layers:
+    - model.blocks.1
+    - model.blocks.3
+    - model.blocks.5
+    - model.blocks.7
+    - model.blocks.9
+    - model.blocks.10
+    - model.blocks.11
+  output:
+    save_path: /path/to/sae_checkpoints
+
+store_cfg:
+  factory: src.packs.clip.models.adapters:create_clip_store
+  provenance:
+    enabled: true
+  defaults:
+    batch_size: 4096
+    low: 4096
+    high: 65536
+    stride: 1
+
+offline_meta:
+  ledger_class: src.packs.clip.offline.offline_meta_parquet:OfflineMetaParquetLedger
+  part_modulus: 128
+
+indexing:
+  out_dir: outputs/clip_imagenet_index_debiased
+  offline_meta_root: outputs/clip_imagenet_index_debiased/offline_meta
+  checkpoint_dir: outputs/clip_imagenet_index_debiased/.state
+  out_prefix: clip_imagenet_vitb16_debiased
+  partition_modulus: 128
+  num_deciles: 10
+  top_k_per_decile: 10
+  random_k_per_feature: 5
+  collect_gate_k: 1
+  seed: 42
+  dedupe:
+    factory: src.packs.clip.indexing.dedupe:by_sample_id
+  l2_warn_threshold: 0.5
+
+logging:
+  level: INFO
+  log_dir: outputs/logs

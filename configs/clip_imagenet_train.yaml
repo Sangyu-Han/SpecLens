@@ -1,0 +1,114 @@
+pack:
+  setup: src.packs.clip.train.factories:setup_env
+
+
+dataset:
+  builder: src.packs.clip.train.factories:build_dataset
+  root: /data/imagenet
+  split: train
+  batch_size: 32
+  shuffle: true
+  drop_last: true
+  image_size: 224
+  interpolation: bicubic
+  mean: [0.48145466, 0.4578275, 0.40821073]
+  std: [0.26862954, 0.26130258, 0.27577711]
+
+model:
+  loader: src.packs.clip.train.factories:load_model
+  name: vit_base_patch16_clip_224
+  pretrained: true
+  dtype: float32
+
+logging:
+  level: INFO
+  log_file: outputs/logs/clip_imagenet_train.log
+  wandb:
+    enabled: true
+    mode: online   # online | offline | disabled
+    project: clip-sae
+    entity: null  # Set your W&B entity
+    run_name: clip-sae-batchtopk
+    group: clip-sae-batchtopk  # DDP면 rank별 run을 이 group으로 묶음
+    tags: [clip-sae, batch-topk]
+  log_every_steps: 100
+  log_hist_every_steps: 10000
+  upload_checkpoints: false  # 아티팩트로 올릴지 여부
+
+sae:
+  store:
+    factory: src.packs.clip.train.factories:create_store
+  layers:
+    - model.blocks.0
+    - model.blocks.1
+    - model.blocks.2
+    - model.blocks.3
+    - model.blocks.4
+    - model.blocks.5
+    - model.blocks.6
+    - model.blocks.7
+    - model.blocks.8
+    - model.blocks.9
+    - model.blocks.10
+    - model.blocks.11
+  output:
+    save_path: outputs/clip_imagenet_sae_batchtopk
+  debug:
+    sync_before_hook_copy: false
+  training:
+    num_training_steps: 10000000
+    ckpt_every_steps: 50000
+    activation_batch_size: 4096
+    n_batches_in_buffer: 2
+    low_watermark_tokens: 4096
+    high_watermark_tokens: 65536
+    batches_per_collect_round: 2
+    min_collect_batches_per_round: 1
+    max_collect_batches_per_round: 4
+    adaptive_collect: true
+    sync:
+      mode: owner_stream
+      transfer_dtype: float16
+      dynamic_chunking: false 
+      chunk_mb: 32
+      max_chunk_mb: 64
+      min_chunk_mb: 4
+    queue:
+      block_size_tokens: 16384
+      in_memory_blocks_per_layer: 32
+      spill_to_disk: false
+    sae_type: batch-topk
+    expansion_factor: 16
+    k: 32
+    k_aux: 128
+    aux_frac: 0.03125
+    lr: 1.0e-3
+    l1_coeff: 0.0
+    input_unit_norm: true
+    n_batches_to_dead: 20
+    dtype: float32
+    seed: 42
+    stride: 8
+
+# ---------------------------------------------------------------------- #
+# VALIDATION
+# ---------------------------------------------------------------------- #
+validation:
+  enabled: true
+  every_steps: 50000        # 학습 스텝마다 검증 캐시로 로깅
+  max_batches: 256           # 캐시용으로 몇 배치까지 돌릴지 (0=무제한)
+  max_tokens_per_layer: 1000000
+  cache_batch_tokens: 4096
+  eval_batch_tokens: 4096
+  per_rank: true           # rank별로 동일한 검증셋 전체를 캐시
+  dataset:
+    builder: src.packs.clip.train.factories:build_dataset
+    root: /data/imagenet/val  # ← 클래스별 샘플 폴더(원하는 경로로 교체)
+    split: null                       # 샘플 폴더만 쓸 때는 split 비움
+    batch_size: 64
+    shuffle: true
+    drop_last: false
+    image_size: 224
+    interpolation: bicubic
+    mean: [0.48145466, 0.4578275, 0.40821073]
+    std: [0.26862954, 0.26130258, 0.27577711]

@@ -1,0 +1,34 @@
+# Clip feature visualization config (for export_unit_viz.py)
+
+indexing:
+  config: configs/clip_imagenet_index.yaml   # model/dataset/SAE/ledger paths
+  # layer: "model.blocks.10::sae_layer#latent"  # optional; can be overridden via --layer
+  deciles: 10
+  topn_per_decile: 5
+
+backward:
+  enabled: true
+  method: "ig"              # ig | grad | input_x_grad
+  ig_steps: 32
+  baseline: "zeros"
+  override_mode: "all_tokens"
+  objective_aggregation: "sum"
+  backward_anchors:
+    ig_active:
+      - "model.patch_embed::pre@0"
+    module:
+      - "model.patch_embed::pre@0"
+      - "model.patch_embed"
+
+heatmap:
+  reduce: "l2"
+  log_q_lo: 0.05
+  log_q_hi: 1.0
+  overlay_alpha: 0.4
+  overlay_cmap: "hot"
+  feature_map_cmap: "plasma"
+  feature_map_min_abs: 0.02
+  compute_feature_activation_map: true
+
+image_path: "otter_head.png"
+pack: "clip"

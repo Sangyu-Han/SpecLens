@@ -1,0 +1,168 @@
+import os
+import pytest
+
+import torch
+from overcomplete.sae import SAE, DictionaryLayer, JumpSAE, TopKSAE, QSAE, BatchTopKSAE, MpSAE, OMPSAE, RATopKSAE, RAJumpSAE
+from overcomplete.sae.modules import TieableEncoder
+
+from ..utils import epsilon_equal
+
+all_sae = [SAE, JumpSAE, TopKSAE, QSAE, BatchTopKSAE, MpSAE, OMPSAE, RATopKSAE, RAJumpSAE]
+
+
+def _load(path):
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def get_sae_kwargs(sae_class, input_size, nb_concepts, device):
+    """Return specific kwargs required for certain SAE classes."""
+    kwargs = {}
+    # archetypal SAEs require 'points'
+    if sae_class in [RATopKSAE, RAJumpSAE]:
+        kwargs['points'] = torch.randn(nb_concepts * 2, input_size, device=device)
+    return kwargs
+
+
+@pytest.mark.parametrize("nb_concepts, dimensions", [(5, 10)])
+def test_save_and_load_dictionary_layer(nb_concepts, dimensions, tmp_path):
+    # Initialize and run layer
+    layer = DictionaryLayer(dimensions, nb_concepts)
+    z = torch.randn(3, nb_concepts)
+    x_hat = layer(z)
+
+    # Validate output shape
+    assert x_hat.shape == (3, dimensions)
+
+    # Save to temporary file
+    model_path = tmp_path / "test_dictionary_layer.pth"
+    torch.save(layer, model_path)
+
+    # Reload and validate
+    layer = torch.load(model_path, map_location="cpu", weights_only=False)
+    assert isinstance(layer, DictionaryLayer)
+
+    # Check consistency after loading
+    x_hat_loaded = layer(z)
+    assert epsilon_equal(x_hat, x_hat_loaded)
+
+
+@pytest.mark.parametrize("sae_class", all_sae)
+def test_save_and_load_sae(sae_class, tmp_path):
+    input_size = 10
+    nb_concepts = 5
+
+    extra_kwargs = get_sae_kwargs(sae_class, input_size, nb_concepts, device='cpu')
+    model = sae_class(input_size, nb_concepts, **extra_kwargs)
+
+    x = torch.randn(3, input_size)
+    output = model(x)
+    z_pre, z, x_hat = output
+
+    # Save using tmp_path
+    model_path = tmp_path / "test_sae.pth"
+    torch.save(model, model_path)
+
+    # Load and validate
+    model_loaded = torch.load(model_path, map_location="cpu", weights_only=False)
+    assert isinstance(model_loaded, sae_class)
+
+    # Run inference again
+    output_loaded = model_loaded(x)
+    z_pre_loaded, z_loaded, x_hat_loaded = output_loaded
+
+    # Validate numerical consistency
+    assert epsilon_equal(z, z_loaded)
+    assert epsilon_equal(x_hat, x_hat_loaded)
+    assert epsilon_equal(z_pre, z_pre_loaded)
+
+
+@pytest.mark.parametrize("sae_class", all_sae)
+def test_eval_and_save_sae(sae_class, tmp_path):
+    input_size = 10
+    nb_concepts = 5
+
+    extra_kwargs = get_sae_kwargs(sae_class, input_size, nb_concepts, device='cpu')
+    model = sae_class(input_size, nb_concepts, **extra_kwargs)
+
+    x = torch.randn(3, input_size)
+    output = model(x)
+    z_pre, z, x_hat = output
+
+    # Save using tmp_path
+    model_path = tmp_path / "test_sae.pth"
+    torch.save(model, model_path)
+
+    # Load, set to eval mode, and validate
+    model_loaded = torch.load(model_path, map_location="cpu", weights_only=False).eval()
+    assert isinstance(model_loaded, sae_class)
+
+    # Run inference again
+    output_loaded = model_loaded(x)
+    z_pre_loaded, z_loaded, x_hat_loaded = output_loaded
+
+    # Validate numerical consistency
+    assert epsilon_equal(z, z_loaded)
+    assert epsilon_equal(x_hat, x_hat_loaded)
+    assert epsilon_equal(z_pre, z_pre_loaded)
+
+
+@pytest.mark.parametrize("sae_class", all_sae)
+def test_save_and_load_tied_sae(sae_class, tmp_path):
+    """Test that tied SAE can be saved and loaded."""
+    input_size = 10
+    nb_concepts = 5
+
+    extra_kwargs = get_sae_kwargs(sae_class, input_size, nb_concepts, device='cpu')
+    model = sae_class(input_size, nb_concepts, **extra_kwargs)
+    model.tied()
+
+    x = torch.randn(3, input_size)
+    output = model(x)
+    z_pre, z, x_hat = output
+
+    # Save
+    model_path = tmp_path / "test_tied_sae.pth"
+    torch.save(model, model_path)
+
+    # Load
+    model_loaded = _load(model_path)
+    assert isinstance(model_loaded, sae_class)
+
+    # Test output consistency
+    output_loaded = model_loaded(x)
+    z_pre_loaded, z_loaded, x_hat_loaded = output_loaded
+
+    assert epsilon_equal(z, z_loaded)
+    assert epsilon_equal(x_hat, x_hat_loaded)
+
+
+@pytest.mark.parametrize("sae_class", all_sae)
+def test_save_and_load_untied_with_copy(sae_class, tmp_path):
+    """Test that untied SAE with copied weights can be saved and loaded."""
+    input_size = 10
+    nb_concepts = 5
+
+    extra_kwargs = get_sae_kwargs(sae_class, input_size, nb_concepts, device='cpu')
+    model = sae_class(input_size, nb_concepts, **extra_kwargs)
+
+    model.tied()
+    model.untied(copy_from_dictionary=True)
+
+    x = torch.randn(3, input_size)
+    output = model(x)
+    z_pre, z, x_hat = output
+
+    # Save
+    model_path = tmp_path / "test_untied_sae.pth"
+    torch.save(model, model_path)
+
+    # Load
+    model_loaded = _load(model_path)
+    assert isinstance(model_loaded, sae_class)
+
+    # Test output consistency
+    output_loaded = model_loaded(x)
+    z_pre_loaded, z_loaded, x_hat_loaded = output_loaded
+
+    assert epsilon_equal(z, z_loaded)
+    assert epsilon_equal(x_hat, x_hat_loaded)

@@ -1,0 +1,125 @@
+# =========================
+# Mask2Former SAE Training Config (SA-V Dataset)
+# =========================
+# Compatible with scripts/train_sae_config.py
+# Usage: python scripts/train_sae_config.py --config configs/mask2former_sav_train.yaml
+
+dataset:
+  # Dataset builder (src.packs.mask2former.dataset.builders)
+  builder: src.packs.mask2former.dataset.builders:build_sav_dataset
+
+  # SA-V dataset paths (adjust to your setup)
+  img_folder: /path/to/sav_frames/JPEGImages_sav
+  gt_folder: /path/to/SA-V-json-flat
+  # Alternative paths:
+  # img_folder: /path/to/sa-v-data
+  # gt_folder: /path/to/sa-v-data
+
+  # Preprocessing
+  resize: 800
+  frame_stride: 4  # Sample every 4th frame
+  max_frames_per_video: null  # null = all frames
+
+  # Training settings
+  batch_size: 2
+  is_train: true
+
+model:
+  name: mask2former_hf
+  hf_model: facebook/mask2former-swin-tiny-coco-instance
+  local_files_only: false
+
+  # Model loader
+  loader: src.packs.mask2former.models.model_loaders:load_mask2former_hf
+
+logging:
+  level: INFO
+  log_dir: outputs/logs
+  wandb:
+    enabled: true
+    mode: online
+    project: mask2former-sae
+    entity: null  # Set your W&B entity
+    run_name: mask2former_sav_train
+    group: mask2former_sav
+
+sae:
+  dump_hook_points:
+    enabled: false
+    path: outputs/hook_specs_all.txt
+    with_sizes: true
+    scope: all
+  # SAE factory
+  factory: src.core.sae.registry:create_sae
+
+  store:
+    factory: src.packs.mask2former.models.adapters:create_mask2former_store
+
+  # Target layers for SAE training (HF Mask2Former)
+  layers:
+    # - model.pixel_level_module.encoder@feature_maps@0
+    # - model.pixel_level_module.encoder@feature_maps@1
+    # - model.pixel_level_module.encoder@feature_maps@2
+    # - model.pixel_level_module.encoder@feature_maps@3
+    # Pixel decoder mask features
+    - model.pixel_level_module.decoder.mask_projection
+    # Transformer decoder attention blocks (outputs are tuples -> @0)
+    - model.transformer_module.decoder.layers.0@0
+    - model.transformer_module.decoder.layers.4@0
+    - model.transformer_module.decoder.layers.8@0
+
+  output:
+    save_path: outputs/mask2former_sav_sae
+
+  training:
+    seed: 42
+    num_training_steps: 10000
+    ckpt_every_steps: 5000
+    prefill_batches: 2
+    use_amp: true
+    buffer_on_cpu: true
+
+    # SAE hyperparams (batch-topk)
+    sae_type: batch-topk
+    k: 32
+    k_aux: 256
+    aux_frac: 0.03125
+    expansion_factor: 16
+    lr: 1.0e-4
+    l1_coeff: 2.0e-3
+    input_unit_norm: true
+    n_batches_to_dead: 20
+
+    # Activation store defaults
+    activation_batch_size: 8192
+    low_watermark_tokens: 4096
+    high_watermark_tokens: 131072
+    stride: 8
+
+    sync:
+      mode: owner_stream
+
+    # per_layer:
+    #   "model.pixel_level_module.encoder@feature_maps@2":
+    #     batch_size: 4096
+    #     high: 2_000_000
+    #     stride: 8
+    #     expansion_factor: 8
+
+    #   "model.pixel_level_module.encoder@feature_maps@3":
+    #     batch_size: 4096
+    #     high: 2_000_000
+    #     stride: 8
+    #     expansion_factor: 8
+
+    #   "model.pixel_level_module.decoder.mask_projection":
+    #     batch_size: 8192
+    #     high: 2_000_000
+    #     stride: 8
+    #     expansion_factor: 8
+
+      # "model.transformer_module.decoder.layers.8.self_attn@0":
+      #   batch_size: 4096
+      #   high: 1_000_000
+      #   stride: 4
+      #   expansion_factor: 16

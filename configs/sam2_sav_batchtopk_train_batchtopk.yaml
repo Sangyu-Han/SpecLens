@@ -1,0 +1,203 @@
+pack:
+  sys_paths:
+    - third_party/sam2_src
+  setup: src.packs.sam2.train.factories:setup_env
+
+
+# ---------------------------------------------------------------------- #
+# DATASET & MODEL (SAM2Train)
+# ---------------------------------------------------------------------- #
+
+
+dataset:
+  builder: src.packs.sam2.train.factories:build_dataset
+  img_folder: /mnt/sav_frames/JPEGImages_sav
+  gt_folder: /mnt/SA-V-json-flat
+  batch_size: 8  # [중요] GPU 1개당 SAM2Train 모델의 배치 크기. (글로벌 배치 = batch_size * GPU 개수)
+  num_frames: 4
+  resize: 1024
+  max_num_objects: 3
+  prompt_policy:
+    dataset_prompt_ratio: 0.05
+    dataset_method: center
+    random_method: uniform
+    init_cond_frames: [0]
+    seed: 12345
+model:
+  loader: src.packs.sam2.train.factories:load_model
+  name: sam2_hiera_t
+  device: cuda  # 이 값은 스크립트에서 rank별로 덮어쓰므로 큰 의미 없음
+  # gpus: [0,1]  # torchrun을 사용하므로 이 설정은 더 이상 필요 없습니다.
+  yaml: configs/models/sam2.1_training/sam2.1_hiera_t.yaml
+  ckpt: checkpoints/models/sam2.1/sam2.1_hiera_tiny.pt
+
+# ---------------------------------------------------------------------- #
+# LOGGING
+# ---------------------------------------------------------------------- #
+logging:
+  level: INFO
+  log_file: outputs/logs/sam2_sav_sae_tiny.log
+  wandb:
+    enabled: true
+    mode: online   # online | offline | disabled
+    project: sam2-sae
+    entity: null  # Set your W&B entity
+    run_name: my-sae-run
+    group: sam2_sav_sae_tiny  # DDP면 rank별 run을 이 group으로 묶음
+    tags: [sam2, sae, batch-topk, tiny]
+  log_every_steps: 10
+  log_hist_every_steps: 1000
+  upload_checkpoints: false  # 아티팩트로 올릴지 여부
+
+# ---------------------------------------------------------------------- #
+# SAE
+# ---------------------------------------------------------------------- #
+sae:
+  store:
+    factory: src.packs.sam2.train.factories:create_store
+  layers:
+    - model.obj_ptr_proj
+    - model.memory_attention.layers.0
+    - model.image_encoder.trunk@3
+    - model.memory_attention.layers.3
+    - model.memory_encoder@vision_features
+    - model.memory_encoder@vision_pos_enc@0
+    - model.sam_mask_decoder.transformer.layers.1@0
+    - model.sam_mask_decoder.transformer.layers.1@1
+
+
+  output:
+    save_path: outputs/sam2_sav_sae_tiny
+
+  debug:
+    sync_before_hook_copy: false  # 필요할 때만 true로 (성능↓)
+
+  training:
+    # === 스케줄 ===
+    num_training_steps: 50000000
+    ckpt_every_steps: 50000
+
+    # === sync & 메모리 전송 ===
+    sync:
+      mode: owner_stream
+      transfer_dtype: float32  # float32 | bfloat16 | float16
+      dynamic_chunking: true
+      chunk_mb: 16       # 동적 실패/백업값
+      min_chunk_tokens: 8192
+      max_chunk_tokens: 262144
+      target_free_frac: 0.6    # 남은 GPU 메모리 사용 비율
+      safety_mb: 256           # 항상 남겨둘 여유
+      max_chunk_mb: 64
+      min_chunk_mb: 4
+
+    collect_policy: all   # all | owner_only
+
+    # === 수집 라운드 자동 튜닝 ===
+    adaptive_collect: true
+    max_collect_batches_per_round: 4  # 상한
+    min_collect_batches_per_round: 1  # 하한
+
+    # === 블록 큐(페이지드 큐) ===
+    queue:
+      hook_copy_chunk_tokens: 8192
+      block_size_tokens: 16384     # 고정 토큰 수/블록
+      in_memory_blocks_per_layer: 64  # 레이어당 RAM 블록 상한
+      spill_to_disk: false
+      spill_dir: "outputs/sae_spill"  # 스필 파일 저장 위치
+
+    # === SAE 타입 & 공통 하이퍼 ===
+    sae_type: batch-topk
+    expansion_factor: 8
+    k: 32
+    k_aux: 128
+    aux_frac: 0.03125
+    lr: 1.0e-4
+    l1_coeff: 0.0
+    input_unit_norm: true
+    n_batches_to_dead: 20
+    dtype: float32
+    seed: 42
+    stride: 8
+
+    # === SAELens 호환 네이밍 ===
+    store_batch_size_prompts: 4        # (기존 dataset.batch_size와 동일 의미, per-rank)
+    train_batch_size_tokens: 4096      # (기존 activation_batch_size)
+    n_batches_in_buffer: 2             # (기존 prefill_batches)
+    max_collect_batches_per_round: 4   # (기존 batches_per_collect_round)
+
+    # === 워터마크(디폴트) ===
+    low_watermark_tokens: 4096
+    high_watermark_tokens: 1_000_000
+
+    # === 레이어별 오버라이드 ===
+    per_layer:
+      "model.image_encoder.trunk@3":
+        batch_size: 4096
+        high: 2_000_000
+        stride: 8
+        k: 32
+        k_aux: 256
+        l1_coeff: 2.0e-3
+        expansion_factor: 8
+
+      "model.memory_encoder@vision_features":
+        batch_size: 8192
+        high: 2_000_000
+        stride: 8
+        k: 32
+        k_aux: 256
+        l1_coeff: 2.0e-3
+        expansion_factor: 8
+
+      "model.memory_encoder@vision_pos_enc":
+        batch_size: 8192
+        high: 2_000_000
+        stride: 8
+        k: 32
+        k_aux: 256
+        l1_coeff: 2.0e-3
+        expansion_factor: 8
+
+      "model.obj_ptr_proj":
+        batch_size: 32  # ✅ 키 이름 통일
+        low: 1
+        high: 100_000
+        micro: 16
+        accum: 4
+        stride: 1
+        k: 16
+        k_aux: 32
+        expansion_factor: 32
+        l1_coeff: 5.0e-4
+
+      "model.sam_mask_decoder.transformer.layers.1@0":
+        batch_size: 128  # ✅ 키 이름 통일
+        high: 100_000
+        stride: 1
+        k: 16
+        k_aux: 32
+        expansion_factor: 32
+
+      "model.sam_mask_decoder.transformer.layers.1@1":
+        batch_size: 8192  # ✅ 키 이름 통일
+        high: 2_000_000
+        stride: 16
+        k: 16
+        k_aux: 32
+        expansion_factor: 32
+
+      "model.memory_attention.layers.0":
+        batch_size: 8192  # ✅ 키 이름 통일
+        high: 2_000_000
+        stride: 8
+        k: 8
+        k_aux: 32
+        expansion_factor: 32
+
+      "model.memory_attention.layers.3":
+        batch_size: 8192  # ✅ 키 이름 통일
+        high: 2_000_000
+        stride: 8
+        k: 8
+        k_aux: 32
+        expansion_factor: 32

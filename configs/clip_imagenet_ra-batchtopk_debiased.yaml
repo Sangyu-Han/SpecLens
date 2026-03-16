@@ -1,0 +1,163 @@
+pack:
+  setup: src.packs.clip.train.factories:setup_env
+
+dataset:
+  builder: src.packs.clip.train.factories:build_dataset
+  root: /path/to/imagenet
+  split: train
+  batch_size: 32
+  shuffle: true
+  drop_last: true
+  image_size: 224
+  interpolation: bicubic
+  mean: [0.48145466, 0.4578275, 0.40821073]
+  std: [0.26862954, 0.26130258, 0.27577711]
+
+model:
+  loader: src.packs.clip.train.factories:load_model
+  name: vit_base_patch16_clip_224
+  pretrained: true
+  dtype: float32
+
+logging:
+  level: INFO
+  log_file: outputs/logs/clip_ra_batchtopk_debiased.log
+  wandb:
+    enabled: true
+    mode: online
+    project: clip-sae
+    entity: null  # Set your W&B entity
+    run_name: my-sae-run
+    group: clip-ra-batchtopk-debiased
+    tags: [clip-sae, ra-batchtopk, debiased]
+  log_every_steps: 100
+  log_hist_every_steps: 10000
+  upload_checkpoints: false
+
+sae:
+  store:
+    factory: src.packs.clip.train.factories:create_store
+  layers:
+    - model.blocks.1
+    - model.blocks.3
+    - model.blocks.5
+    - model.blocks.7
+    - model.blocks.9
+    - model.blocks.10
+    - model.blocks.11
+
+  output:
+    save_path: /path/to/sae_checkpoints
+
+  debug:
+    sync_before_hook_copy: false
+
+  training:
+    num_training_steps: 200_000
+    ckpt_every_steps: 20_000
+    keep_last_ckpts: 3
+    buffer_on_cpu: true
+
+    sync:
+      mode: owner_stream
+      transfer_dtype: float32
+      dynamic_chunking: true
+      chunk_mb: 16
+      min_chunk_tokens: 8192
+      max_chunk_tokens: 262144
+      target_free_frac: 0.6
+      safety_mb: 256
+      max_chunk_mb: 64
+      min_chunk_mb: 4
+
+    collect_policy: all
+    adaptive_collect: true
+    max_collect_batches_per_round: 4
+    min_collect_batches_per_round: 1
+
+    queue:
+      hook_copy_chunk_tokens: 8192
+      block_size_tokens: 16384
+      in_memory_blocks_per_layer: 8
+      spill_to_disk: false
+      mix_buffer_batches: 16
+      mix_fraction: 0.5
+      diversity:
+        enabled: true
+        k: 128
+        resample_every: 5
+
+    # === RA-BatchTopK Debiased Core ===
+    sae_type: ra-batchtopk
+    loss_name: top_k_auxiliary_loss
+    expansion_factor: 32
+    k: 128
+    k_aux: 512
+    aux_penalty: 0.03125
+    reanim_coeff: 1.0e-3
+    nmse_weight: 0.0
+    lr: 3.0e-4
+    lr_final: 1.0e-5
+    warmup_steps: 1000
+    l1_coeff: 0.0
+    input_unit_norm: false
+    input_global_center_norm: true
+    b_dec_init: "mean"
+    delta: 0.5
+    n_batches_to_dead: 500
+    dtype: float32
+    seed: 42
+    random_subsample_rate: 0.5
+    random_subsample_seed: 42
+
+    # === Freq / Bias monitoring ===
+    freq_ema_decay: 0.999
+    spatial_var_penalty: 0.3
+    spatial_var_freq_threshold: 0.01
+    freq_penalty_coeff: 0.0
+    bev_penalty: 0.0
+
+    # === Bias feature folding ===
+    fold_every_steps: 100
+    fold_freq_threshold: 0.95
+    fold_cv_threshold: 0.02
+
+    warmup:
+      enabled: true
+      data_dir: /path/to/kmeans_data
+      epochs: 2
+      batch_size: 4096
+      shuffle: true
+      max_steps: 5000
+
+    kmeans_init:
+      enabled: true
+      centroids_dir: /path/to/kmeans_centers
+
+    train_batch_size_tokens: 2048
+    n_batches_in_buffer: 2
+
+    low_watermark_tokens: 4096
+    high_watermark_tokens: 500_000
+
+    per_layer: {}
+
+validation:
+  enabled: true
+  every_steps: 50000
+  max_batches: 16
+  max_tokens_per_layer: 50000
+  cache_batch_tokens: 4096
+  eval_batch_tokens: 4096
+  per_rank: true
+  dataset:
+    builder: src.packs.clip.train.factories:build_dataset
+    root: /path/to/imagenet
+    split: val
+    batch_size: 64
+    shuffle: true
+    drop_last: false
+    image_size: 224
+    interpolation: bicubic
+    mean: [0.48145466, 0.4578275, 0.40821073]
+    std: [0.26862954, 0.26130258, 0.27577711]

@@ -1,0 +1,84 @@
+pack:
+  setup: src.packs.resnet.train.factories:setup_env
+
+
+dataset:
+  builder: src.packs.resnet.train.factories:build_dataset
+  root: /path/to/imagenet/imagenet
+  split: train
+  batch_size: 32
+  shuffle: true
+  drop_last: true
+  image_size: 224
+  interpolation: bicubic
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+
+model:
+  loader: src.packs.resnet.train.factories:load_model
+  name: resnet18
+  pretrained: true
+  dtype: float32
+
+
+logging:
+  level: INFO
+  log_file: outputs/logs/resnet18_imagenet_train.log
+  wandb:
+    enabled: true
+    mode: online   # online | offline | disabled
+    project: resnet-sae
+    entity: null  # Set your W&B entity
+    run_name: resnet18-sae-batchtopk
+    group: resnet18-sae-batchtopk
+    tags: [resnet18-sae, batch-topk]
+  log_every_steps: 100
+  log_hist_every_steps: 10000
+  upload_checkpoints: false
+
+
+sae:
+  store:
+    factory: src.packs.resnet.train.factories:create_store
+  layers:
+    - model.layer3.0
+    - model.layer4.1
+  output:
+    save_path: outputs/resnet18_imagenet_sae_batchtopk
+  debug:
+    sync_before_hook_copy: false
+  training:
+    num_training_steps: 10000000
+    ckpt_every_steps: 50000
+    activation_batch_size: 4096
+    n_batches_in_buffer: 2
+    low_watermark_tokens: 4096
+    high_watermark_tokens: 65536
+    batches_per_collect_round: 2
+    min_collect_batches_per_round: 1
+    max_collect_batches_per_round: 4
+    adaptive_collect: true
+    sync:
+      mode: owner_stream
+      transfer_dtype: float16
+      dynamic_chunking: false
+      chunk_mb: 32
+      max_chunk_mb: 64
+      min_chunk_mb: 4
+    queue:
+      block_size_tokens: 16384
+      in_memory_blocks_per_layer: 32
+      spill_to_disk: false
+    sae_type: batch-topk
+    expansion_factor: 16
+    k: 32
+    k_aux: 128
+    aux_frac: 0.03125
+    lr: 1.0e-3
+    l1_coeff: 0.0
+    input_unit_norm: true
+    n_batches_to_dead: 20
+    dtype: float32
+    seed: 42
+    stride: 1

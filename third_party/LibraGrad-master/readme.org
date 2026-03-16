@@ -1,0 +1,105 @@
+#+TITLE: LibraGrad: Balancing Gradient Flow for Universally Better Vision Transformer Attributions
+#+options: toc:3
+#+EXCLUDE_TAGS: noexport
+
+To understand model decisions, attribution methods measure how input features contribute to outputs. LibraGrad enhances all gradient-based attribution methods for Transformers through theoretically-motivated gradient flow balancing,  leading to fast and faithful post-hoc explanations. For theoretical foundations and comprehensive quantitative and qualitative evaluations, see our [[https://arxiv.org/pdf/2411.16760][paper]].
+
+# Read the [[https://arxiv.org/pdf/2411.16760][paper]].
+# Read the [[https://raw.githack.com/NightMachinery/LibraGrad/master/paper/LibraGrad_v2.4.5_with_appendices.pdf][paper]].
+# Appendix C of the paper contains many multi-object qualitative examples.
+
+# [[./images/fig_1.png]]
+# [[./images/main_001_cropped.png]]
+# [[./images/main_002_cropped.png]]
+[[./images/main_001_cropped.jpeg]]
+[[./images/main_002_cropped.jpeg]]
+
+* COMMENT _ :noexport:
+** [[https://arxiv.org/abs/2411.16760][{2411.16760} LibraGrad: Balancing Gradient Flow for Universally Better Vision Transformer Attributions]]
+
+** [[id:9b138a2b-f5b3-46a5-a496-7452c77cc109][Github/pages/create]]
+:PROPERTIES:
+:ID:       648abab6-2601-40e6-9612-1a7f474d9884
+:END:
+*** [[https://nightmachinery.github.io/LibraGrad/][LibraGrad: Balancing Gradient Flow for Universally Better Vision Transformer Attributions]]
+:PROPERTIES:
+:ID:       f6ba8bcc-d17c-4429-91f0-117e34703142
+:END:
+
+*** Add the correct favicon
+:PROPERTIES:
+:ID:       e6a9d4a5-a657-4171-8b7f-2dbb6d75a80a
+:END:
+#+begin_src zsh :eval never
+deus org-export-recursive readme.org ; gmv readme.html index.html
+
+# html_favicon.py favicon.svg --input=index.html --output=index.html
+#: The favicon will be added automatically when it exists.
+#+end_src
+
+**** [[https://fontawesome.com/v5/icons/balance-scale?s=solid][Balance Scale Icon | Font Awesome]]
+:PROPERTIES:
+:ID:       f3e274c6-cb6e-47dc-9f3f-b82a7116a68b
+:END:
+
+* Abstract
+:PROPERTIES:
+:ID:       2d8d8584-ff9f-4eb8-b400-01d060112415
+:END:
+Why do gradient-based explanations struggle with Transformers, and how can we improve them? We identify gradient flow imbalances in Transformers that violate FullGrad-completeness, a critical property for attribution faithfulness that CNNs naturally possess. To address this issue, we introduce LibraGrad—a theoretically grounded post-hoc approach that corrects gradient imbalances through pruning and scaling of backward paths, without changing the forward pass or adding computational overhead. We evaluate LibraGrad using three metric families: Faithfulness, which quantifies prediction changes under perturbations of the most and least relevant features; Completeness Error, which measures attribution conservation relative to model outputs; and Segmentation AP, which assesses alignment with human perception. Extensive experiments across 8 architectures, 4 model sizes, and 4 datasets show that LibraGrad universally enhances gradient-based methods, outperforming existing white-box methods—including Transformer-specific approaches—across all metrics. We demonstrate superior qualitative results through two complementary evaluations: precise text-prompted region highlighting on CLIP models and accurate class discrimination between co-occurring animals on ImageNet-finetuned models—two settings on which existing methods often struggle. LibraGrad is effective even on the attention-free MLP-Mixer architecture, indicating potential for extension to other modern architectures.
+
+* Code
+:PROPERTIES:
+:ID:       57bad82d-f0e8-4421-bff1-85590fbbd38e
+:END:
+The code of this paper is distributed across three repositories:
+- [[https://github.com/NightMachinery/decompv-libragrad-v1][NightMachinery/decompv-libragrad-v1]]
+
+- [[https://github.com/NightMachinery/pytorch-image-models-libragrad-v1][NightMachinery/pytorch-image-models-libragrad-v1]]
+  
+
+- [[https://github.com/NightMachinery/PyNight][NightMachinery/PyNight: My Python utility library.]]
+
+** Notebooks
+:PROPERTIES:
+:ID:       c6676863-c8a7-4133-8f78-bba3ea73d9e8
+:END:
+We offer two interactive notebooks:
+
+1. [[https://colab.research.google.com/github/NightMachinery/LibraGrad/blob/master/notebooks/llama3.ipynb][Implementing LibraGrad From Scratch for Llama 3]]
+   - This comprehensive, self-contained notebook serves as the primary reference implementation for LibraGrad
+   - Ideal for practitioners who have studied the theoretical foundations in the paper
+   - Enables visualization of attribution maps for next token prediction tasks on textual data
+
+2. [[https://colab.research.google.com/github/NightMachinery/LibraGrad/blob/master/notebooks/CLIP.ipynb][CLIP Feature Attribution via LibraGrad]]
+   - Enables visualization of attribution maps for any combination of images and text prompts
+   - Features automatic setup that handles all repository installations and dependencies
+
+* Support
+:PROPERTIES:
+:ID:       56e6fdff-5190-4490-896e-6dee43aa55d1
+:END:
+Found LibraGrad helpful? Star our repository ([[https://github.com/NightMachinery/LibraGrad][github.com/NightMachinery/LibraGrad]]) and cite our LibraGrad and FullGrad+ papers:
+
+# @todo update the bibtex for LibraGrad, use bibtidy
+#+begin_src bibtex
+@misc{mehri-libragrad,
+  title         = {{LibraGrad}: Balancing Gradient Flow for Universally Better Vision Transformer Attributions},
+  author        = {Faridoun Mehri and Mahdieh Soleymani Baghshah and Mohammad Taher Pilehvar},
+  year          = {2024},
+  eprint        = {2411.16760},
+  archiveprefix = {arXiv},
+  primaryclass  = {cs.CV},
+  url           = {https://arxiv.org/abs/2411.16760},
+}
+
+@inproceedings{mehri-skipplus-cvpr24,
+  title         = {{SkipPLUS}: Skip the First Few Layers to Better Explain Vision Transformers},
+  author        = {Faridoun Mehri and Mohsen Fayyaz and Mahdieh Soleymani Baghshah and Mohammad Taher Pilehvar},
+  booktitle     = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR) Workshops},
+  month         = {June},
+  year          = {2024},
+  pages         = {204--215},
+  url           = {https://openaccess.thecvf.com/content/CVPR2024W/TCV2024/html/Mehri\%5FSkipPLUS\%5FSkip\%5Fthe\%5FFirst\%5FFew\%5FLayers\%5Fto\%5FBetter\%5FExplain\%5FVision\%5FCVPRW\%5F2024\%5Fpaper.html},
+}
+#+end_src

@@ -1,0 +1,105 @@
+[tool.poetry]
+name = "sae-lens"
+version = "6.22.3"
+description = "Training and Analyzing Sparse Autoencoders (SAEs)"
+authors = ["Joseph Bloom"]
+readme = "README.md"
+packages = [{ include = "sae_lens" }]
+include = ["pretrained_saes.yaml"]
+repository = "https://github.com/decoderesearch/SAELens"
+homepage = "https://decoderesearch.github.io/SAELens"
+license = "MIT"
+keywords = [
+    "deep-learning",
+    "sparse-autoencoders",
+    "mechanistic-interpretability",
+    "PyTorch",
+]
+classifiers = ["Topic :: Scientific/Engineering :: Artificial Intelligence"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+transformer-lens = "^2.16.1"
+transformers = "^4.38.1"
+plotly = ">=5.19.0"
+plotly-express = ">=0.4.1"
+datasets = ">=3.1.0"
+babe = "^0.0.7"
+nltk = "^3.8.1"
+safetensors = ">=0.4.2,<1.0.0"
+mamba-lens = { version = "^0.0.4", optional = true }
+python-dotenv = ">=1.0.1"
+pyyaml = "^6.0.1"
+typing-extensions = "^4.10.0"
+simple-parsing = "^0.1.6"
+tenacity = ">=9.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.2"
+pytest-cov = "^4.1.0"
+pre-commit = "^3.6.2"
+pyright = "1.1.365"
+mamba-lens = "^0.0.4"
+ansible-lint = { version = "^24.2.3", markers = "platform_system != 'Windows'" }
+botocore = "^1.34.101"
+boto3 = "^1.34.101"
+docstr-coverage = "^2.3.2"
+mkdocs = "^1.6.1"
+mkdocs-material = "^9.5.34"
+mkdocs-autorefs = "^1.4.2"
+mkdocs-section-index = "^0.3.9"
+mkdocstrings = "^0.25.2"
+mkdocstrings-python = "^1.10.9"
+tabulate = "^0.9.0"
+ruff = "^0.7.4"
+eai-sparsify = "^1.1.1"
+mike = "^2.0.0"
+trio = "^0.30.0"
+dictionary-learning = "^0.1.0"
+
+[tool.poetry.extras]
+mamba = ["mamba-lens"]
+
+[tool.ruff.lint]
+exclude = ["*.ipynb"]
+ignore = ["E203", "E501", "E731", "F722", "E741", "F821", "F403", "ARG002"]
+select = ["UP", "TID", "I", "F", "E", "ARG", "SIM", "RET", "LOG", "T20"]
+
+[tool.ruff.lint.per-file-ignores]
+"benchmark/*" = ["T20", "TID251"]
+"scripts/*" = ["T20"]
+"tests/*" = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"typing.Union".msg = "Use `|` instead"
+"typing.Optional".msg = "Use `| None` instead"
+"typing.Dict".msg = "Use `dict` instead"
+"typing.Tuple".msg = "Use `tuple` instead"
+"typing.List".msg = "Use `list` instead"
+"tests".msg = "Do not import from tests in the main codebase."
+
+[tool.pyright]
+typeCheckingMode = "strict"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownVariableType = "none"
+reportUntypedFunctionDecorator = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnnecessaryComparison = "none"
+reportConstantRedefinition = "none"
+reportUnknownLambdaType = "none"
+reportPrivateUsage = "none"
+reportDeprecated = "none"
+reportPrivateImportUsage = "none"
+ignore = ["**/wandb/**"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.semantic_release]
+version_variables = ["sae_lens/__init__.py:__version__"]
+version_toml = ["pyproject.toml:tool.poetry.version"]
+build_command = "pip install poetry && poetry build"
+branches = { main = { match = "main" }, alpha = { match = "alpha", prerelease = true }, beta = { match = "beta", prerelease = true } }

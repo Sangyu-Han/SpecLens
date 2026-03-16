@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speclens"
+version = "0.1.0"
+description = "SpecLens: Universal SAE training, feature indexing, and attribution for any PyTorch model via Spec-based layer hooking"
+authors = [{ name = "Your Name" }]
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# PyTorch must be installed separately with the correct CUDA version.
+# See README for installation instructions.
+dependencies = [
+  "omegaconf>=2.3",
+  "transformers",
+  "PyYAML>=6.0",
+  "numpy>=1.24",
+  "opencv-python-headless>=4.8",
+  "Pillow>=9.5",
+  "tqdm>=4.66",
+  "wandb>=0.16",
+  "pandas",
+  "pyarrow",
+  "timm",
+  "faiss-gpu",   # or faiss-cpu if no GPU available
+]
+
+[project.optional-dependencies]
+sam2 = [
+  "pycocotools>=2.0.7",
+  "iopath",
+  "submitit",
+  "tensordict",
+]
+dev = [
+  "black>=24.3.0",
+  "ruff>=0.4.0",
+  "pytest>=8.0",
+]
+
+[project.scripts]
+speclens-train = "scripts.train_sae_config:main"
+speclens-index = "scripts.sae_index_main:main"
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "scripts*"]

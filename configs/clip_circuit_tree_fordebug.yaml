@@ -1,0 +1,47 @@
+pack: "clip"
+
+indexing:
+  config: configs/clip_imagenet_index.yaml
+
+target:
+  layer: "model.blocks.10::sae_layer#latent"
+  unit: 8146
+  override_mode: "all_tokens"
+  objective_aggregation: "sum"
+
+backward:
+  enabled: true
+  method: "ig"
+  ig_steps: 32
+  baseline: "zeros"
+  override_mode: "all_tokens"
+  backward_anchors:
+    ig_active:
+      - "model.patch_embed::pre@0"
+    module:
+      - "model.patch_embed::pre@0"
+      - "model.blocks.10::sae_layer#latent"
+      - "model.blocks.9::sae_layer#latent"
+      - "model.blocks.9::sae_layer#error_coeff"
+    stop_grad: []
+
+forward:
+  enabled: true
+  method: "input_x_grad"
+  ig_steps: 32
+  baseline: "zeros"
+  override_mode: "all_tokens"
+  forward_anchors:
+    ig_active: []
+    module:
+      - "model.blocks.11::sae_layer#latent"
+      - "model.blocks.11::sae_layer#error_coeff"
+
+heatmap:
+  reduce: "l2"
+  log_q_lo: 0.05
+  log_q_hi: 1.0
+  save_overlays: false
+
+output:
+  root: "./outputs/clip_attr_debug"
