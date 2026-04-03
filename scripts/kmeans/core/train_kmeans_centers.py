@@ -387,7 +387,7 @@ class FaissKMeansTrainer:
         logger.info(f"Data loaded in {load_time:.1f}s")
 
         # Convert to float32 numpy
-        data_np = data.float().numpy()
+        data_np = data.float().cpu().numpy()
         del data
         torch.cuda.empty_cache()
 
@@ -465,7 +465,7 @@ class FaissKMeansTrainer:
             if pq is None:
                 raise ImportError("PyArrow is required for Parquet format.")
 
-            centroids_np = centroids.numpy().astype(np.float32)
+            centroids_np = centroids.cpu().numpy().astype(np.float32)
             list_type = pa.list_(pa.float32(), act_size)
             centroids_list = [row.tolist() for row in centroids_np]
             centroids_array = pa.array(centroids_list, type=list_type)

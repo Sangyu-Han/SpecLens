@@ -304,7 +304,7 @@ def run_indexing(config_path: str, *, l2_warn_threshold: Optional[float] = None)
         logger.info("[index] Model loaded & wrapped in DDP (rank=%d/%d)", rank, world)
 
         ds, dist_sampler = ds_builder(cfg["dataset"], world_size=world, rank=rank)
-        collate_fn = collate_builder(ds)
+        collate_fn = collate_builder(ds, prompt_policy=cfg["dataset"].get("prompt_policy"))
         offline_ledger = build_offline_ledger(cfg)
         store_cfg = dict(cfg.get("store_cfg", {}))
         store_cfg.setdefault("device", str(device))

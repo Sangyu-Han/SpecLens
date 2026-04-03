@@ -56,6 +56,18 @@ def build_indexing_dataset(cfg_ds: Dict[str, Any], *, world_size: int, rank: int
         ann_every=ann_every,
     )
 
+    # annotated frame 수가 num_frames 미만인 비디오 제거 (NCCL hang 방지)
+    import os as _os, logging as _logging
+    _logger = _logging.getLogger(__name__)
+    before = len(base.video_names)
+    base.video_names = [
+        v for v in base.video_names
+        if len(_os.listdir(_os.path.join(img_folder, v))) >= num_frames
+    ]
+    filtered = before - len(base.video_names)
+    if filtered:
+        _logger.info(f"[build_indexing_dataset] Filtered {filtered} videos with < {num_frames} frames.")
+
     # 프레임/오브젝트 샘플러 (결정적, reverse off)
     sampler = SafeRandomUniformSampler(
         num_frames=num_frames,

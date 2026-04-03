@@ -39,7 +39,7 @@ class TopKSAE(BaseAutoencoder):
         x_std = getattr(self, "x_std", torch.ones_like(recon[:1]))
         return self.postprocess_output(recon, x_mean, x_std)
 
-    def get_loss_dict(self, x: torch.Tensor, x_reconstruct: torch.Tensor, pre: torch.Tensor, 
+    def get_loss_dict(self, x: torch.Tensor, x_reconstruct: torch.Tensor, pre: torch.Tensor,
                       acts_topk: torch.Tensor, x_mean: torch.Tensor, x_std: torch.Tensor) -> Dict[str, torch.Tensor]:
         l2_loss = (x_reconstruct.float() - x.float()).pow(2).mean()
         l1_norm = acts_topk.float().abs().sum(-1).mean()
@@ -47,10 +47,17 @@ class TopKSAE(BaseAutoencoder):
         l0_norm = (acts_topk > 0).float().sum(-1).mean()
         aux_loss = self.get_auxiliary_loss(x, x_reconstruct, pre)
         loss = l2_loss + l1_loss + aux_loss
-        
+
         num_dead_features = (self.num_batches_not_active > self.config.get("n_batches_to_dead", 20)).sum()
         sae_out = self.postprocess_output(x_reconstruct, x_mean, x_std)
-        
+
+        # relative_l2: ||x_orig - sae_out||^2 / ||x_orig||^2  (SAELens-style, in original space)
+        with torch.no_grad():
+            x_orig = self.postprocess_output(x.float(), x_mean, x_std)
+            per_sample_resid_sq = (x_orig - sae_out.float()).pow(2).sum(-1)
+            per_sample_x_sq = x_orig.pow(2).sum(-1)
+            relative_l2 = (per_sample_resid_sq / (per_sample_x_sq + 1e-8)).mean()
+
         return {
             "sae_out": sae_out,
             "feature_acts": acts_topk,
@@ -61,6 +68,7 @@ class TopKSAE(BaseAutoencoder):
             "l0_norm": l0_norm,
             "l1_norm": l1_norm,
             "aux_loss": aux_loss,
+            "relative_l2": relative_l2,
         }
 
     def get_auxiliary_loss(self, x: torch.Tensor, x_reconstruct: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:

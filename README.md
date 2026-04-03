@@ -257,6 +257,10 @@ The output is a Sankey diagram or JSON edge list for downstream visualization.
 
 Configs are YAML files in `configs/`. Key sections:
 
+For output-side metrics and optional `KL + MSE` E2E training, see:
+
+- [docs/sae_output_metrics_and_e2e.md](docs/sae_output_metrics_and_e2e.md)
+
 ```yaml
 # Which dataset/model to use
 dataset:

@@ -507,6 +507,7 @@ class UniversalActivationStore:
         self._recv_buf_cache = {}  # (layer_name, src_rank) -> GPU 텐서
         self.collect_policy = sync_cfg.get("collect_policy", "all")  # 'all' | 'owner_only'
         self.layer_owners: Dict[str, int] = {}
+        self.capture_enabled: bool = True
 
         # --- adaptive collect ---
         tcfg = (self.cfg.get("training") or {})
@@ -527,6 +528,9 @@ class UniversalActivationStore:
         self._pair_locks = {lname: Lock() for lname in self.expanded_hook_points}
         self.queues: Dict[str, TokenBlockQueue] = {}
         self.mix_buffers: Dict[str, MixingBuffer] = {}
+        # Multi-variant fan-out queues: lname → {vname → TokenBlockQueue}
+        self.variant_queues: Dict[str, Dict[str, TokenBlockQueue]] = {}
+        self._layer_variants: Dict[str, List[str]] = {}  # registered variants per layer
         # === provenance on/off ===
         prov_cfg = (self.cfg.get("provenance") or {})
         self.enable_provenance = bool(prov_cfg.get("enabled", False))
@@ -1028,6 +1032,71 @@ class UniversalActivationStore:
         t = t.contiguous()
         self.activations[lname].append(t)
         
+    def register_variants(self, lname: str, variant_names: List[str]) -> None:
+        """Register named training variants for a layer.
+
+        After registration, activations pushed to ``queues[lname]`` are fanned-out
+        to per-variant queues when any variant first requests a batch via
+        ``next_batch(..., variant=vname)``.
+
+        Call *before* the first ``collect_round``.
+        """
+        if not variant_names:
+            return
+        block = self.block_size_tokens
+        cap = (int(self.in_memory_blocks_per_layer) if self.in_memory_blocks_per_layer is not None else None)
+        spill_base = self.spill_dir if self.spill_to_disk else None
+        allow_gpu = not self.buffer_on_cpu
+
+        per_v: Dict[str, TokenBlockQueue] = {}
+        for vname in variant_names:
+            safe_name = f"{lname}@{vname}".replace("/", "_").replace("\\", "_").replace(":", "_")
+            spill_here = (spill_base / safe_name if spill_base else None)
+            per_v[vname] = TokenBlockQueue(
+                block_size_tokens=block,
+                spill_dir=spill_here,
+                in_memory_blocks_cap=cap,
+                lname=safe_name,
+                allow_gpu=allow_gpu,
+            )
+        self.variant_queues[lname] = per_v
+        self._layer_variants[lname] = list(variant_names)
+        logger.info(
+            "[Variants] Layer '%s': registered %d variants: [%s]",
+            lname, len(variant_names), ", ".join(variant_names),
+        )
+
+    def _fanout_to_variants(self, lname: str) -> int:
+        """Drain ``queues[lname]`` and push a copy into every variant queue.
+
+        Returns number of tokens fanned-out (0 if source was already empty).
+        Uses the per-layer lock to be thread-safe.
+        """
+        src_q = self.queues.get(lname)
+        var_qs = self.variant_queues.get(lname, {})
+        if not var_qs or src_q is None or src_q.ntoks == 0:
+            return 0
+
+        fanned = 0
+        lock = self._pair_locks.get(lname)
+        ctx = lock if lock is not None else nullcontext()
+        with ctx:
+            while src_q.ntoks > 0:
+                chunk_size = min(src_q.ntoks, src_q.block)
+                chunk = src_q.pop_batch(chunk_size, shuffle=False)
+                if chunk is None:
+                    break
+                for vq in var_qs.values():
+                    vq.push(chunk)  # each push() creates its own contiguous copy
+                fanned += chunk.shape[0]
+
+        if fanned > 0:
+            logger.debug(
+                "[Fanout] '%s': distributed %d tokens to %d variants (%s)",
+                lname, fanned, len(var_qs), ", ".join(var_qs.keys()),
+            )
+        return fanned
+
     def _update_queue_counters(self, lname: str):
         """큐에 push된 직후 호출: init/peak 토큰 수 업데이트."""
         q = self.queues.get(lname)
@@ -1173,6 +1242,8 @@ class UniversalActivationStore:
 
         def make_hook(b_name: str, targets: set[str]):
             def hook_fn(module, inputs, output):
+                if not self.capture_enabled:
+                    return None
                 # 평탄화
                 pairs = walk_tensors(b_name, output, allowed_prefixes=targets)
                 my_rank = (dist.get_rank() if (dist.is_initialized() and dist.get_world_size() > 1) else 0)
@@ -2072,7 +2143,33 @@ class UniversalActivationStore:
     # ---------- consumer API ----------
 
     def next_batch(self, layer_name: str, batch_size: Optional[int] = None,
-                   shuffle: bool = True) -> Optional[torch.Tensor]:
+                   shuffle: bool = True, variant: Optional[str] = None) -> Optional[torch.Tensor]:
+        # --- variant fast-path ---
+        if variant is not None:
+            var_qs = self.variant_queues.get(layer_name, {})
+            if variant not in var_qs:
+                logger.warning(
+                    "[Variants] next_batch: variant '%s' not registered for layer '%s'",
+                    variant, layer_name,
+                )
+                return None
+            if batch_size is None:
+                bs = int(self._cfg_for_layer(layer_name).get("batch_size", self.activation_batch_size))
+            else:
+                bs = int(batch_size)
+            # Fan-out any fresh data from source queue to all variant queues
+            self._fanout_to_variants(layer_name)
+            # Serve from this variant's independent FIFO
+            vq = var_qs[variant]
+            batch = vq.pop_batch(bs, shuffle=shuffle)
+            if batch is None:
+                logger.debug("[Variants] next_batch: variant '%s' layer '%s' queue empty (ntoks=%d)",
+                             variant, layer_name, vq.ntoks)
+                return None
+            logger.debug("[Variants] next_batch: variant '%s' layer '%s' → %d tokens (remaining=%d)",
+                         variant, layer_name, batch.shape[0], vq.ntoks)
+            return batch.to(self.device, non_blocking=True)
+
         if layer_name not in self.queues:
             return None
         if batch_size is None:

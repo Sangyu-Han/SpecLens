@@ -1,0 +1,108 @@
+pack:
+  setup: src.packs.clip.train.factories:setup_env
+
+dataset:
+  builder: src.packs.clip.train.factories:build_dataset
+  root: /tmp/spec_debug_imagenet
+  split: train
+  batch_size: 2
+  shuffle: true
+  drop_last: false
+  image_size: 224
+  interpolation: bicubic
+  mean: [0.48145466, 0.4578275, 0.40821073]
+  std: [0.26862954, 0.26130258, 0.27577711]
+
+model:
+  loader: src.packs.clip.train.factories:load_model
+  name: vit_base_patch16_clip_224
+  pretrained: false
+  dtype: float32
+
+logging:
+  level: INFO
+  log_file: outputs/logs/clip_e2e_debug.log
+  wandb:
+    enabled: false
+    mode: disabled
+  log_every_steps: 1
+  log_hist_every_steps: 0
+  upload_checkpoints: false
+
+sae:
+  store:
+    factory: src.packs.clip.train.factories:create_store
+  layers:
+    - model.blocks.1
+  output:
+    save_path: outputs/clip_imagenet_e2e_debug
+  training:
+    num_training_steps: 2
+    ckpt_every_steps: 0
+    keep_last_ckpts: 1
+
+    activation_batch_size: 64
+    n_batches_in_buffer: 1
+    low_watermark_tokens: 64
+    high_watermark_tokens: 512
+    batches_per_collect_round: 1
+    min_collect_batches_per_round: 1
+    max_collect_batches_per_round: 1
+    adaptive_collect: false
+    max_steps_per_cycle: 1
+
+    sync:
+      mode: none
+
+    queue:
+      block_size_tokens: 256
+      in_memory_blocks_per_layer: 8
+      spill_to_disk: false
+
+    sae_type: topk
+    expansion_factor: 4
+    k: 8
+    k_aux: 32
+    aux_penalty: 0.03125
+    l1_coeff: 0.0
+    input_unit_norm: true
+    input_global_center_norm: false
+    n_batches_to_dead: 10
+
+    lr: 1.0e-4
+    lr_final: 0.0
+    warmup_steps: 0
+    clip_grad: 1.0
+    dtype: float32
+    seed: 42
+    stride: 1
+    speed_log_every_sec: 0.0
+
+    e2e_loss_name: kl_mse
+    e2e_balance: dynamic
+    e2e_every_steps: 1
+    e2e_start_step: 0
+    e2e_total_coeff: 1.0
+
+validation:
+  enabled: true
+  every_steps: 1
+  max_batches: 1
+  max_tokens_per_layer: 4096
+  cache_batch_tokens: 256
+  eval_batch_tokens: 256
+  per_rank: true
+  dataset:
+    builder: src.packs.clip.train.factories:build_dataset
+    root: /tmp/spec_debug_imagenet
+    split: val
+    batch_size: 2
+    shuffle: false
+    drop_last: false
+    image_size: 224
+    interpolation: bicubic
+    mean: [0.48145466, 0.4578275, 0.40821073]
+    std: [0.26862954, 0.26130258, 0.27577711]
+  output_metrics:
+    enabled: true
+    max_batches: 1

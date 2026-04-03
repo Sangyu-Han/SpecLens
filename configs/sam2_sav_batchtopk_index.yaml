@@ -1,0 +1,150 @@
+# =========================
+# SAMv2 BatchTopK SAE Indexing Config
+# Checkpoint: outputs/sam2_sav_batchtopk_ef32_k64
+# =========================
+
+pack:
+  sys_paths:
+    - third_party/sam2_src
+  setup: src.packs.sam2.train.factories:setup_env
+
+dataset:
+  builder: src.packs.sam2.dataset.sa_v.builders:build_indexing_dataset
+  collate_builder: src.packs.sam2.dataset.sa_v.repro_vosdataset:make_repro_collate
+
+  img_folder: /media/sangyu/T7/sa-v_dataset/sav_frames/JPEGImages_sav
+  gt_folder: /media/sangyu/T7/sa-v_dataset/SA-V-json-flat
+  file_list_txt: configs/sav_index_10k_videos.txt
+  batch_size: 4
+  num_frames: 4
+  resize: 1024
+  max_num_objects: 3
+  prompt_policy:
+    dataset_prompt_ratio: 0.5
+    dataset_method: center
+    random_method: uniform
+    init_cond_frames: [0]
+    seed: 12345
+
+model:
+  name: sam2_hiera_t
+  yaml: configs/models/sam2.1_training/sam2.1_hiera_t.yaml
+  ckpt: checkpoints/models/sam2.1/sam2.1_hiera_tiny.pt
+  loader: src.packs.sam2.models.model_loaders:load_sam2
+
+logging:
+  level: INFO
+  log_dir: outputs/logs
+  wandb:
+    enabled: true
+    mode: online
+    project: sam2-sae-index
+    entity: acoexist96
+    run_name: sam2_sav_batchtopk_ef32_k64_index
+    group: sam2_sav_batchtopk_ef32_k64_index
+
+sae:
+  factory: src.core.sae.registry:create_sae
+  sae_type: batch-topk
+
+  layers:
+    - model.image_encoder.trunk@3
+    - model.memory_attention.layers.0
+    - model.memory_attention.layers.3
+    - model.memory_encoder@vision_features
+    - model.memory_encoder@vision_pos_enc@0
+    - model.obj_ptr_proj
+    - model.sam_mask_decoder.transformer.layers.1@0
+    - model.sam_mask_decoder.transformer.layers.1@1
+
+  output:
+    save_path: outputs/sam2_sav_batchtopk_ef32_k64
+
+store_cfg:
+  factory: src.packs.sam2.models.adapters:create_sam2eval_store
+
+  provenance:
+    enabled: true
+  sync:
+    mode: owner_stream
+  defaults:
+    batch_size: 4096
+    low: 4096
+    high: 2_000_000
+    stride: 1
+    expansion_factor: 32
+    k: 64
+    k_aux: 512
+
+  per_layer:
+    "model.image_encoder.trunk@3":
+      batch_size: 4096
+      high: 2_000_000
+      k: 64
+
+    "model.memory_attention.layers.0":
+      batch_size: 8192
+      high: 2_000_000
+      k: 32
+
+    "model.memory_attention.layers.3":
+      batch_size: 8192
+      high: 2_000_000
+      k: 32
+
+    "model.memory_encoder@vision_features":
+      batch_size: 8192
+      high: 2_000_000
+      k: 64
+
+    "model.memory_encoder@vision_pos_enc@0":
+      batch_size: 8192
+      high: 2_000_000
+      k: 64
+
+    "model.obj_ptr_proj":
+      batch_size: 32
+      low: 1
+      high: 100_000
+      k: 16
+      k_aux: 64
+
+    "model.sam_mask_decoder.transformer.layers.1@0":
+      batch_size: 128
+      high: 100_000
+      k: 16
+
+    "model.sam_mask_decoder.transformer.layers.1@1":
+      batch_size: 8192
+      high: 2_000_000
+      k: 32
+
+  prompts:
+    enable: true
+    out_dir: outputs/sae_index_batchtopk_ef32_k64/.state/prompts
+    rows_per_shard: 200000
+    row_group_size: 8192
+    prompt_probability: 1.0
+    num_positive_points: 1
+    num_negative_points: 0
+    use_centroid: true
+
+offline_meta:
+  ledger_class: src.packs.sam2.offline.offline_meta_ledger:OfflineMetaParquetLedger
+
+indexing:
+  out_dir: outputs/sae_index_batchtopk_ef32_k64
+  partition_modulus: 128
+  offline_meta_root: outputs/sae_index_batchtopk_ef32_k64/offline_meta
+
+  out_prefix: sam2_sav_tiny
+  seed: 12345
+
+  mode: topn
+  top_n: 300
+  track_frequency: true
+
+  checkpoint_dir: outputs/sae_index_batchtopk_ef32_k64/.state
+  checkpoint_every_steps: 100
+
+  run_id: "sam2_batchtopk_run_sav"

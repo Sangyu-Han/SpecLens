@@ -1,0 +1,225 @@
+pack:
+  setup: src.packs.clip.train.factories:setup_env
+
+dataset:
+  builder: src.packs.clip.train.factories:build_dataset
+  root: /home/mipal/data/ILSVRC2012
+  split: train
+  batch_size: 32
+  shuffle: true
+  drop_last: true
+  image_size: 224
+  interpolation: bicubic
+  mean: [0.48145466, 0.4578275, 0.40821073]
+  std: [0.26862954, 0.26130258, 0.27577711]
+
+model:
+  loader: src.packs.clip.train.factories:load_model
+  name: vit_base_patch16_clip_224
+  pretrained: true
+  dtype: float32
+
+logging:
+  level: INFO
+  log_file: outputs/logs/clip_ablation.log
+  wandb:
+    enabled: true
+    mode: online
+    project: clip-sae
+    entity: acoexist96
+    run_name: clip-ablation-7v
+    group: clip-ablation-7v
+    tags: [clip-sae, ablation, batch-topk, ra-batchtopk, debiased]
+  log_every_steps: 200
+  log_hist_every_steps: 10000
+  upload_checkpoints: false
+
+sae:
+  store:
+    factory: src.packs.clip.train.factories:create_store
+  layers:
+    - model.blocks.1
+    - model.blocks.3
+    - model.blocks.5
+    - model.blocks.7
+    - model.blocks.9
+    - model.blocks.10
+    - model.blocks.11
+  output:
+    save_path: outputs/clip_ablation_7v
+  debug:
+    sync_before_hook_copy: false
+
+  training:
+    num_training_steps: 200000
+    ckpt_every_steps: 25000
+    keep_last_ckpts: 3
+    buffer_on_cpu: true
+
+    # CPU offload: keep only 1 variant on GPU at a time (saves ~6x GPU memory)
+    offload_inactive_variants: true
+
+    sync:
+      mode: owner_stream
+      transfer_dtype: float16
+      dynamic_chunking: true
+      chunk_mb: 16
+      min_chunk_tokens: 8192
+      max_chunk_tokens: 262144
+      target_free_frac: 0.6
+      safety_mb: 256
+      max_chunk_mb: 64
+      min_chunk_mb: 4
+
+    collect_policy: all
+    adaptive_collect: true
+    max_collect_batches_per_round: 4
+    min_collect_batches_per_round: 1
+    max_steps_per_cycle: 4
+
+    queue:
+      block_size_tokens: 16384
+      in_memory_blocks_per_layer: 8
+      spill_to_disk: false
+      mix_buffer_batches: 16
+      mix_fraction: 0.5
+
+    # Shared hyperparams (apply to all variants unless overridden)
+    expansion_factor: 32
+    k: 64
+    k_aux: 256
+    aux_frac: 0.03125
+    lr: 3.0e-4
+    lr_final: 1.0e-5
+    warmup_steps: 1000
+    l1_coeff: 0.0
+    dtype: float32
+    seed: 42
+    speed_log_every_sec: 30.0
+
+    # Bias monitoring (for all variants)
+    freq_ema_decay: 0.999
+    spatial_var_freq_threshold: 0.01
+
+    # Shared defaults for ra variants (may be overridden per-variant)
+    loss_name: top_k_auxiliary_loss
+    aux_penalty: 0.03125
+    delta: 0.5
+    nmse_weight: 0.0
+    input_global_center_norm: false   # overridden per ra-variant
+    b_dec_init: zeros                 # overridden per ra-variant
+    n_batches_to_dead: 20             # overridden per ra-variant
+
+    # K-means init (used by ra-* variants only; batch-topk ignores this)
+    kmeans_init:
+      enabled: true
+      centroids_dir: outputs/kmeans_centers/clip_ablation
+
+    # ─────────────────────────────────────────────────────────────────
+    # 7 ABLATION VARIANTS  (shared activation buffer — 1 forward pass)
+    # ─────────────────────────────────────────────────────────────────
+    variants:
+      # V1: Standard BatchTopK — control baseline (no RA init, no debiasing)
+      - name: batchtopk
+        sae_type: batch-topk
+        input_unit_norm: true
+        input_global_center_norm: false
+        b_dec_init: zeros
+        n_batches_to_dead: 20
+
+      # V2: RA-BatchTopK — only RA initialization, no extra debiasing losses
+      - name: ra
+        sae_type: ra-batchtopk
+        input_unit_norm: false
+        input_global_center_norm: true
+        b_dec_init: mean
+        n_batches_to_dead: 500
+        reanim_coeff: 0.0
+        freq_penalty_coeff: 0.0
+        spatial_var_penalty: 0.0
+        bev_penalty: 0.0
+
+      # V3: RA + dead-feature reanimation only
+      - name: ra-reanim
+        sae_type: ra-batchtopk
+        input_unit_norm: false
+        input_global_center_norm: true
+        b_dec_init: mean
+        n_batches_to_dead: 500
+        reanim_coeff: 1.0e-3
+        freq_penalty_coeff: 0.0
+        spatial_var_penalty: 0.0
+        bev_penalty: 0.0
+
+      # V4: RA + frequency penalty only
+      - name: ra-freq
+        sae_type: ra-batchtopk
+        input_unit_norm: false
+        input_global_center_norm: true
+        b_dec_init: mean
+        n_batches_to_dead: 500
+        reanim_coeff: 0.0
+        freq_penalty_coeff: 1.0e-3
+        spatial_var_penalty: 0.0
+        bev_penalty: 0.0
+
+      # V5: RA + spatial variance penalty only
+      - name: ra-svar
+        sae_type: ra-batchtopk
+        input_unit_norm: false
+        input_global_center_norm: true
+        b_dec_init: mean
+        n_batches_to_dead: 500
+        reanim_coeff: 0.0
+        freq_penalty_coeff: 0.0
+        spatial_var_penalty: 0.3
+        bev_penalty: 0.0
+
+      # V6: RA + BEV penalty only
+      - name: ra-bev
+        sae_type: ra-batchtopk
+        input_unit_norm: false
+        input_global_center_norm: true
+        b_dec_init: mean
+        n_batches_to_dead: 500
+        reanim_coeff: 0.0
+        freq_penalty_coeff: 0.0
+        spatial_var_penalty: 0.0
+        bev_penalty: 0.01
+
+      # V7: RA + all debiasing losses + bias-feature folding
+      - name: ra-all
+        sae_type: ra-batchtopk
+        input_unit_norm: false
+        input_global_center_norm: true
+        b_dec_init: mean
+        n_batches_to_dead: 500
+        reanim_coeff: 1.0e-3
+        freq_penalty_coeff: 1.0e-3
+        spatial_var_penalty: 0.3
+        bev_penalty: 0.01
+        fold_every_steps: 1000
+        fold_freq_threshold: 0.95
+        fold_cv_threshold: 0.02
+
+    per_layer: {}
+
+validation:
+  enabled: true
+  every_steps: 25000
+  max_batches: 16
+  max_tokens_per_layer: 50000
+  cache_batch_tokens: 4096
+  eval_batch_tokens: 4096
+  per_rank: true
+  dataset:
+    builder: src.packs.clip.train.factories:build_dataset
+    root: /home/mipal/data/ILSVRC2012/val
+    split: null
+    batch_size: 64
+    shuffle: true
+    drop_last: false
+    image_size: 224
+    interpolation: bicubic
+    mean: [0.48145466, 0.4578275, 0.40821073]
+    std: [0.26862954, 0.26130258, 0.27577711]

@@ -1,0 +1,230 @@
+pack:
+  sys_paths:
+    - third_party/sam2_src
+  setup: src.packs.sam2.train.factories:setup_env
+
+dataset:
+  builder: src.packs.sam2.train.factories:build_dataset
+  img_folder: /media/sangyu/T7/sa-v_dataset/sav_frames/JPEGImages_sav
+  gt_folder: /media/sangyu/T7/sa-v_dataset/SA-V-json-flat
+  batch_size: 1
+  num_frames: 4
+  resize: 1024
+  max_num_objects: 3
+  prompt_policy:
+    dataset_prompt_ratio: 0.5
+    dataset_method: center
+    random_method: uniform
+    init_cond_frames: [0]
+    seed: 12345
+
+model:
+  loader: src.packs.sam2.train.factories:load_model
+  name: sam2_hiera_t
+  device: cuda
+  yaml: configs/models/sam2.1_training/sam2.1_hiera_t.yaml
+  ckpt: checkpoints/models/sam2.1/sam2.1_hiera_tiny.pt
+
+logging:
+  level: INFO
+  log_file: outputs/logs/sam2_sav_ablation.log
+  wandb:
+    enabled: true
+    mode: online
+    project: sam2-sae
+    entity: acoexist96
+    run_name: sam2-ablation-7v
+    group: sam2-ablation-7v
+    tags: [sam2, sae, ablation, batch-topk, ra-batchtopk, debiased]
+  log_every_steps: 20
+  log_hist_every_steps: 2000
+  upload_checkpoints: false
+
+sae:
+  store:
+    factory: src.packs.sam2.train.factories:create_store
+  layers:
+    - model.image_encoder.trunk@3
+    - model.memory_attention.layers.3
+    - model.sam_mask_decoder.transformer.layers.1@1
+
+  output:
+    save_path: outputs/sam2_sav_ablation_7v
+
+  debug:
+    sync_before_hook_copy: false
+
+  training:
+    num_training_steps: 200000
+    ckpt_every_steps: 5000
+    keep_last_ckpts: 3
+
+    # CPU offload: trunk@3 variants are 768-dim (300MB each × 7 = 2.1GB),
+    # combined with SAMv2 model (~1GB) and activation buffers exceeds 24GB VRAM.
+    offload_inactive_variants: true
+
+    sync:
+      mode: owner_stream
+      transfer_dtype: float32
+      dynamic_chunking: true
+      chunk_mb: 16
+      min_chunk_tokens: 8192
+      max_chunk_tokens: 262144
+      target_free_frac: 0.6
+      safety_mb: 256
+      max_chunk_mb: 64
+      min_chunk_mb: 4
+
+    collect_policy: all
+    adaptive_collect: true
+    max_collect_batches_per_round: 4
+    min_collect_batches_per_round: 1
+    max_steps_per_cycle: 4
+
+    queue:
+      block_size_tokens: 16384
+      in_memory_blocks_per_layer: 16
+      spill_to_disk: false
+      mix_buffer_batches: 8
+      mix_fraction: 0.5
+      diversity:
+        enabled: true
+        k: 64
+        resample_every: 5
+
+    # Shared hyperparams
+    expansion_factor: 32
+    k: 64
+    k_aux: 512
+    aux_frac: 0.03125
+    lr: 2.0e-4
+    lr_final: 2.0e-5
+    warmup_steps: 1000
+    l1_coeff: 0.0
+    dtype: float32
+    seed: 42
+    stride: 1
+    speed_log_every_sec: 30.0
+
+    # Bias monitoring
+    freq_ema_decay: 0.999
+    spatial_var_freq_threshold: 0.01
+
+    # Shared ra defaults
+    loss_name: top_k_auxiliary_loss
+    aux_penalty: 0.03125
+    delta: 0.5
+    nmse_weight: 0.0
+    input_global_center_norm: false
+    b_dec_init: zeros
+    n_batches_to_dead: 20
+
+    kmeans_init:
+      enabled: true
+      centroids_dir: outputs/kmeans_centers/sam2_ablation
+
+    # ─────────────────────────────────────────────────────────────
+    # 9 ABLATION VARIANTS
+    # Q: Which technique fixes bias features in batch-topk?
+    # Variants 1-8: sae_type=batch-topk, one technique added per variant
+    # Variant 9: ra-batchtopk + all (full model, RA architecture reference)
+    # ─────────────────────────────────────────────────────────────
+    variants:
+      - name: batchtopk
+        sae_type: batch-topk
+        input_unit_norm: true
+        input_global_center_norm: false
+        b_dec_init: zeros
+        n_batches_to_dead: 20
+
+      - name: btk-gcenter
+        sae_type: batch-topk
+        input_unit_norm: false
+        input_global_center_norm: true
+        b_dec_init: mean
+        n_batches_to_dead: 500
+
+      - name: btk-reanim
+        sae_type: batch-topk
+        input_unit_norm: false
+        input_global_center_norm: false
+        b_dec_init: zeros
+        n_batches_to_dead: 500
+        reanim_coeff: 1.0e-3
+
+      - name: btk-freq
+        sae_type: batch-topk
+        input_unit_norm: false
+        input_global_center_norm: false
+        b_dec_init: zeros
+        n_batches_to_dead: 500
+        freq_penalty_coeff: 1.0e-3
+
+      - name: btk-svar
+        sae_type: batch-topk
+        input_unit_norm: false
+        input_global_center_norm: false
+        b_dec_init: zeros
+        n_batches_to_dead: 500
+        spatial_var_penalty: 0.3
+
+      - name: btk-bev
+        sae_type: batch-topk
+        input_unit_norm: false
+        input_global_center_norm: false
+        b_dec_init: zeros
+        n_batches_to_dead: 500
+        bev_penalty: 0.01
+
+      - name: btk-fold
+        sae_type: batch-topk
+        input_unit_norm: false
+        input_global_center_norm: false
+        b_dec_init: zeros
+        n_batches_to_dead: 500
+        fold_every_steps: 1000
+        fold_freq_threshold: 0.95
+        fold_cv_threshold: 0.02
+
+      - name: btk-all
+        sae_type: batch-topk
+        input_unit_norm: false
+        input_global_center_norm: true
+        b_dec_init: mean
+        n_batches_to_dead: 500
+        reanim_coeff: 1.0e-3
+        freq_penalty_coeff: 1.0e-3
+        spatial_var_penalty: 0.3
+        bev_penalty: 0.01
+        fold_every_steps: 1000
+        fold_freq_threshold: 0.95
+        fold_cv_threshold: 0.02
+
+      - name: ra-all
+        sae_type: ra-batchtopk
+        input_unit_norm: false
+        input_global_center_norm: true
+        b_dec_init: mean
+        n_batches_to_dead: 500
+        reanim_coeff: 1.0e-3
+        freq_penalty_coeff: 1.0e-3
+        spatial_var_penalty: 0.3
+        bev_penalty: 0.01
+        fold_every_steps: 1000
+        fold_freq_threshold: 0.95
+        fold_cv_threshold: 0.02
+
+    per_layer:
+      "model.image_encoder.trunk@3":
+        batch_size: 4096
+        high: 2000000
+
+      "model.memory_attention.layers.3":
+        batch_size: 8192
+        high: 2000000
+        k: 32
+
+      "model.sam_mask_decoder.transformer.layers.1@1":
+        batch_size: 8192
+        high: 2000000
+        k: 32

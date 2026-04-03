@@ -14,18 +14,23 @@ import sys
 import yaml
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import re  # <= 파일명에서 step 파싱용
 import gc
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 from src.core.indexing.registry_utils import load_obj
 from src.core.sae.kmeans.utils import sanitize_layer_name, load_centroids, centroids_path
+from src.core.runtime.capture import LayerCapture
+from src.core.runtime.wrappers import wrap_target_layer_with_sae
+from src.utils.utils import resolve_module
 # project root
 project_root = Path(__file__).resolve().parents[4]
 if str(project_root) not in sys.path:
@@ -114,6 +119,7 @@ class SAETrainingPipeline:
         self.wandb_run = None
         self.wandb_cfg = self.config.get("logging", {}).get("wandb", {})
         self.tokens_seen: Dict[str, int] = {}   # ✅ 레이어 토큰 카운터
+        self.my_lv_keys: list[str] = []  # all (layer, variant) keys this rank owns
         # validation 캐시
         self.validation_cache: dict[str, torch.Tensor] = {}
         self.validation_ready: bool = False
@@ -146,6 +152,288 @@ class SAETrainingPipeline:
         if n >= 1_000:
             return f"{n/1_000:.1f}k"
         return f"{n}"
+
+    # ========================== variant helpers ==========================
+
+    @staticmethod
+    def _lv_key(lname: str, vname: str) -> str:
+        """Compose layer-variant key.  'default' variant → lname (backward compat)."""
+        return lname if vname == "default" else f"{lname}@@{vname}"
+
+    @staticmethod
+    def _lv_parse(key: str) -> tuple[str, str]:
+        """Parse lv_key → (lname, vname).  Simple lname → vname='default'."""
+        if "@@" in key:
+            lname, vname = key.split("@@", 1)
+            return lname, vname
+        return key, "default"
+
+    @staticmethod
+    def _safe_key(lv_key: str) -> str:
+        """Sanitize lv_key for use as wandb metric prefix."""
+        return lv_key.replace("/", "_").replace("@@", "__").replace(":", "_")
+
+    @staticmethod
+    def _module_device(module: nn.Module) -> torch.device:
+        for p in module.parameters():
+            return p.device
+        for b in module.buffers():
+            return b.device
+        return torch.device("cpu")
+
+    def _variants_for_layer(self, lname: str) -> list[dict]:
+        """Return list of variant config dicts for a layer.
+
+        Config key: ``sae.training.variants`` — list of dicts with at least a
+        ``name`` field plus any per-variant overrides (sae_type, k, l1_coeff, …).
+        Falls back to ``[{'name': 'default'}]`` when absent (backward compat).
+        """
+        tr = self.config["sae"]["training"]
+        variants_cfg = tr.get("variants") or []
+        if isinstance(variants_cfg, list) and variants_cfg:
+            return variants_cfg
+        return [{"name": "default"}]
+
+    def _variant_overrides_for(self, lname: str, vname: str) -> dict[str, Any]:
+        for var_cfg in self._variants_for_layer(lname):
+            if var_cfg.get("name", "default") == vname:
+                return {k: v for k, v in var_cfg.items() if k != "name"}
+        return {}
+
+    def _runtime_cfg_for_lv(self, lv_key: str) -> dict[str, Any]:
+        """Activation-store layer config plus variant-local overrides."""
+        lname, vname = self._lv_parse(lv_key)
+        base_cfg: dict[str, Any] = {}
+        if self.activation_store is not None:
+            try:
+                base_cfg = dict(self.activation_store._cfg_for_layer(lname))
+            except Exception:
+                base_cfg = {}
+        return {**base_cfg, **self._variant_overrides_for(lname, vname)}
+
+    def _ckpt_dir_for(self, lname: str, vname: str) -> Path:
+        """Checkpoint directory for a (layer, variant) pair.
+
+        'default' variant preserves the original single-level path for backward
+        compatibility with existing checkpoints.
+        """
+        save_root = Path(self.config["sae"]["output"]["save_path"])
+        base = save_root / sanitize_layer_name(lname)
+        if vname == "default":
+            return base
+        return base / vname
+
+    def _unwrap_model(self) -> nn.Module:
+        model = self.model
+        if model is None:
+            raise RuntimeError("Model is not initialized.")
+        return model.module if isinstance(model, DDP) else model
+
+    @staticmethod
+    def _move_batch_to_device(batch: Any, device: torch.device) -> Any:
+        if torch.is_tensor(batch):
+            return batch.to(device, non_blocking=True)
+        if isinstance(batch, dict):
+            return {k: SAETrainingPipeline._move_batch_to_device(v, device) for k, v in batch.items()}
+        if isinstance(batch, list):
+            return [SAETrainingPipeline._move_batch_to_device(v, device) for v in batch]
+        if isinstance(batch, tuple):
+            return tuple(SAETrainingPipeline._move_batch_to_device(v, device) for v in batch)
+        return batch
+
+    @contextmanager
+    def _store_capture_disabled(self):
+        store = self.activation_store
+        prev: Optional[bool] = None
+        if store is not None and hasattr(store, "capture_enabled"):
+            prev = bool(store.capture_enabled)
+            store.capture_enabled = False
+        try:
+            yield
+        finally:
+            if store is not None and prev is not None:
+                store.capture_enabled = prev
+
+    @staticmethod
+    def _extract_labels(batch: Any) -> Optional[torch.Tensor]:
+        if not isinstance(batch, dict):
+            return None
+        for key in ("labels", "label", "targets", "target"):
+            value = batch.get(key)
+            if torch.is_tensor(value):
+                return value
+        return None
+
+    @staticmethod
+    def _extract_logits(output: Any) -> Optional[torch.Tensor]:
+        if torch.is_tensor(output):
+            return output
+        if isinstance(output, dict):
+            for key in ("logits", "output", "pred", "preds"):
+                value = output.get(key)
+                if torch.is_tensor(value):
+                    return value
+            return None
+        if isinstance(output, (list, tuple)):
+            for item in output:
+                if torch.is_tensor(item):
+                    return item
+        return None
+
+    def _forward_model_logits(
+        self,
+        batch: Any,
+        *,
+        enable_grad: bool,
+        disable_store_capture: bool = False,
+    ) -> Optional[torch.Tensor]:
+        model = self.model
+        if model is None:
+            raise RuntimeError("Model is not initialized.")
+
+        def _run_forward() -> Optional[torch.Tensor]:
+            grad_ctx = torch.enable_grad() if enable_grad else torch.no_grad()
+            with grad_ctx:
+                if torch.is_tensor(batch):
+                    output = model(batch)
+                elif isinstance(batch, dict):
+                    if "pixel_values" in batch:
+                        output = model(batch["pixel_values"])
+                    elif "input_ids" in batch:
+                        output = model(batch["input_ids"])
+                    else:
+                        kwargs = {
+                            k: v for k, v in batch.items()
+                            if torch.is_tensor(v) and k not in {"labels", "label", "targets", "target", "sample_ids", "sample_id"}
+                        }
+                        try:
+                            output = model(**kwargs)
+                        except TypeError:
+                            if len(kwargs) != 1:
+                                raise
+                            output = model(next(iter(kwargs.values())))
+                else:
+                    output = model(batch)
+            return self._extract_logits(output)
+
+        if disable_store_capture:
+            with self._store_capture_disabled():
+                return _run_forward()
+        return _run_forward()
+
+    @staticmethod
+    def _logits_kl_loss(
+        new_logits: torch.Tensor,
+        orig_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        new_flat = new_logits.reshape(-1, new_logits.shape[-1])
+        orig_flat = orig_logits.reshape(-1, orig_logits.shape[-1])
+        return F.kl_div(
+            F.log_softmax(new_flat, dim=-1),
+            F.log_softmax(orig_flat, dim=-1),
+            log_target=True,
+            reduction="batchmean",
+        )
+
+    def _run_sae_recon_forward(
+        self,
+        lv_key: str,
+        batch: Any,
+        *,
+        add_error: bool,
+        enable_grad: bool,
+    ) -> tuple[Optional[torch.Tensor], dict[str, torch.Tensor]]:
+        sae = self.sae_models.get(lv_key)
+        if sae is None:
+            return None, {}
+
+        lname, _ = self._lv_parse(lv_key)
+        capture = LayerCapture(lname)
+        owner_module = resolve_module(self._unwrap_model(), capture.base)
+        restore, physical = wrap_target_layer_with_sae(
+            owner_module,
+            capture=capture,
+            sae=sae,
+            controller=None,
+            frame_getter=None,
+        )
+        if not add_error:
+            physical.set_anchor_override("error_coeff", lambda t: torch.zeros_like(t))
+
+        try:
+            logits = self._forward_model_logits(
+                batch,
+                enable_grad=enable_grad,
+                disable_store_capture=True,
+            )
+            ctx = physical.sae_context()
+        finally:
+            physical.clear_context()
+            restore()
+        return logits, ctx
+
+    def _compute_e2e_kl_mse_loss(
+        self,
+        lv_key: str,
+        raw_batch: Any,
+        cfg_lv: dict[str, Any],
+    ) -> tuple[Optional[torch.Tensor], dict[str, float]]:
+        if raw_batch is None:
+            return None, {}
+
+        run_cfg = {**(self.config.get("sae", {}).get("training", {}) or {}), **cfg_lv}
+        batch = self._move_batch_to_device(raw_batch, self.device)
+        with torch.no_grad():
+            orig_logits = self._forward_model_logits(
+                batch,
+                enable_grad=False,
+                disable_store_capture=True,
+            )
+        if orig_logits is None:
+            return None, {}
+
+        new_logits, ctx = self._run_sae_recon_forward(
+            lv_key,
+            batch,
+            add_error=False,
+            enable_grad=True,
+        )
+        if new_logits is None:
+            return None, {}
+
+        sae_input = ctx.get("sae_input")
+        recon = ctx.get("recon")
+        if sae_input is None or recon is None:
+            return None, {}
+
+        mse_coeff = float(run_cfg.get("e2e_mse_coeff", 1.0))
+        kl_coeff = float(run_cfg.get("e2e_kl_coeff", 1.0))
+        total_coeff = float(run_cfg.get("e2e_total_coeff", 1.0))
+        balance = str(run_cfg.get("e2e_balance", "fixed")).strip().lower()
+        mse_loss = F.mse_loss(recon.float(), sae_input.float())
+        kl_loss = self._logits_kl_loss(new_logits, orig_logits.detach())
+        alpha_kl = None
+        if balance in {"dynamic", "paper", "paper_dynamic"}:
+            alpha_kl = (mse_loss / (kl_loss + 1e-8)).detach()
+            total = total_coeff * 0.5 * (mse_loss + alpha_kl * kl_loss)
+        else:
+            total = total_coeff * (mse_coeff * mse_loss + kl_coeff * kl_loss)
+
+        stats = {
+            "e2e/mse": float(mse_loss.detach().item()),
+            "e2e/logits_kl": float(kl_loss.detach().item()),
+            "e2e/total": float(total.detach().item()),
+        }
+        if alpha_kl is not None:
+            stats["e2e/alpha_kl"] = float(alpha_kl.detach().item())
+        labels = self._extract_labels(batch)
+        if labels is not None and labels.ndim == 1:
+            orig_ce = F.cross_entropy(orig_logits, labels)
+            new_ce = F.cross_entropy(new_logits, labels)
+            stats["e2e/orig_ce"] = float(orig_ce.detach().item())
+            stats["e2e/recon_ce"] = float(new_ce.detach().item())
+            stats["e2e/delta_ce"] = float((new_ce - orig_ce).detach().item())
+        return total, stats
 
     def _print_buffer_progress(self, force: bool = False):
         """각 레이어 큐의 '남은 토큰 / 초기 토큰' 상황을 tqdm처럼 출력."""
@@ -348,9 +636,10 @@ class SAETrainingPipeline:
         m = re.search(r"step_(\d+)", p.name)
         return int(m.group(1)) if m else -1
 
-    def _find_latest_ckpt_path(self, lname: str) -> Path | None:
-        """레이어 디렉토리에서 가장 step이 큰 체크포인트 경로 반환."""
-        layer_dir = self._sanitize_layer_dir(lname)
+    def _find_latest_ckpt_path(self, lv_key: str) -> Path | None:
+        """Return the latest checkpoint path for a (layer, variant) key."""
+        lname, vname = self._lv_parse(lv_key)
+        layer_dir = self._ckpt_dir_for(lname, vname)
         if not layer_dir.exists():
             return None
         candidates = list(layer_dir.glob("*.pt"))
@@ -367,6 +656,26 @@ class SAETrainingPipeline:
                 if torch.is_tensor(v):
                     state[k] = v.to(device)
 
+    def _move_sae_and_optimizer(
+        self,
+        lv_key: str,
+        device: torch.device | str,
+        opt: Optional[torch.optim.Optimizer] = None,
+    ) -> bool:
+        sae = self.sae_models.get(lv_key)
+        if sae is None:
+            return False
+
+        target = torch.device(device)
+        current = self._module_device(sae)
+        if current == target:
+            return False
+
+        sae.to(target)
+        if opt is not None and opt.state:
+            self._move_optimizer_state_to_device(opt, target)
+        return True
+
     def _resume_from_checkpoints(self, opt_for: dict[str, torch.optim.Optimizer],
                                  steps_done: dict[str, int]) -> None:
         """
@@ -374,41 +683,42 @@ class SAETrainingPipeline:
         - SAE 가중치/옵티마이저 state/step/tokens_seen 복구
         - W&B를 쓰면 초기 스텝/토큰 카운터도 업데이트
         """
-        for lname in self.my_layers_to_train:
-            latest = self._find_latest_ckpt_path(lname)
+        for lv in self.my_lv_keys:
+            lname, _ = self._lv_parse(lv)
+            latest = self._find_latest_ckpt_path(lv)
             if latest is None:
                 continue
 
             try:
                 pkg = torch.load(latest, map_location="cpu")
             except Exception as e:
-                logger.warning(f"[Rank {self.rank}] Failed to load ckpt for {lname} ({latest}): {e}")
+                logger.warning(f"[Rank {self.rank}] Failed to load ckpt for {lv} ({latest}): {e}")
                 continue
 
             # 1) SAE 가중치
-            sae = self.sae_models[lname]
+            sae = self.sae_models[lv]
             try:
                 sae.load_state_dict(pkg.get("sae_state", {}), strict=False)
-                sae.to(self.device)
             except Exception as e:
-                logger.warning(f"[Rank {self.rank}] SAE state load mismatch for {lname}: {e}")
+                logger.warning(f"[Rank {self.rank}] SAE state load mismatch for {lv}: {e}")
+            sae_device = self._module_device(sae)
 
             # 2) 옵티마이저
-            opt = opt_for[lname]
+            opt = opt_for[lv]
             try:
                 opt.load_state_dict(pkg.get("optimizer_state", {}))
-                self._move_optimizer_state_to_device(opt, self.device)
+                self._move_optimizer_state_to_device(opt, sae_device)
             except Exception as e:
-                logger.warning(f"[Rank {self.rank}] Optimizer state load failed for {lname}: {e}")
+                logger.warning(f"[Rank {self.rank}] Optimizer state load failed for {lv}: {e}")
 
             # 3) step / tokens_seen 복구
             restored_step = int(pkg.get("step", self._parse_step_from_path(latest)))
             restored_tokens = int(pkg.get("tokens_seen", 0))
-            steps_done[lname] = max(steps_done.get(lname, 0), restored_step)
-            self.tokens_seen[lname] = max(self.tokens_seen.get(lname, 0), restored_tokens)
+            steps_done[lv] = max(steps_done.get(lv, 0), restored_step)
+            self.tokens_seen[lv] = max(self.tokens_seen.get(lv, 0), restored_tokens)
 
             logger.info(
-                f"[Rank {self.rank}] Resumed {lname} from {latest.name} "
+                f"[Rank {self.rank}] Resumed {lv} from {latest.name} "
                 f"(step={restored_step}, tokens_seen={self._fmt_num(restored_tokens)})"
             )
 
@@ -418,13 +728,13 @@ class SAETrainingPipeline:
                 points = self._load_kmeans_centers(lname, act_size)
                 if points is not None:
                     centroid_mean = points.mean(dim=0)
-                    sae.b_norm.data.copy_(centroid_mean.to(self.device))
-                    logger.info(f"[Rank {self.rank}] Re-initialized b_norm from centroid mean for {lname} (old ckpt)")
+                    sae.b_norm.data.copy_(centroid_mean.to(sae_device))
+                    logger.info(f"[Rank {self.rank}] Re-initialized b_norm from centroid mean for {lv} (old ckpt)")
 
             # 4) (선택) W&B 초기 카운터 업데이트
             if self.wandb_run:
-                safe = lname.replace("/", "_")
-                self._wandb_log({f"{safe}/step": steps_done[lname], f"{safe}/token_seen": self.tokens_seen[lname]})
+                safe = self._safe_key(lv)
+                self._wandb_log({f"{safe}/step": steps_done[lv], f"{safe}/token_seen": self.tokens_seen[lv]})
     # ----------------------------- model -----------------------------------
 
     def _load_model(self) -> nn.Module:
@@ -442,6 +752,7 @@ class SAETrainingPipeline:
             full_config=self.config,
         )
         model = model.eval()  # SAE 학습 중에는 평가 모드로 고정
+        model.requires_grad_(False)
         if isinstance(model, DDP):
             return model
         if not isinstance(model, nn.Module):
@@ -661,15 +972,32 @@ class SAETrainingPipeline:
         self.my_layers_to_train = [ln for ln in layers_to_train if owners.get(ln, -1) == self.rank]
         logger.info(f"[Rank {self.rank}] owner of {len(self.my_layers_to_train)} layers: {self.my_layers_to_train}")
 
+        # Build per-(layer, variant) key list
+        self.my_lv_keys = []
+        lname_to_vnames: Dict[str, List[str]] = {}
+        for lname in self.my_layers_to_train:
+            for var_cfg in self._variants_for_layer(lname):
+                vname = var_cfg.get("name", "default")
+                lv = self._lv_key(lname, vname)
+                self.my_lv_keys.append(lv)
+                lname_to_vnames.setdefault(lname, []).append(vname)
+
+        # Register multi-variant layers with the activation store (fan-out support)
+        for lname, vnames in lname_to_vnames.items():
+            if len(vnames) > 1:
+                self.activation_store.register_variants(lname, vnames)
+                logger.info("[Rank %d] Shared buffer: layer '%s' → %d variants: %s",
+                            self.rank, lname, len(vnames), vnames)
+
         # === W&B metric 정의(레이어 확정 후) ===
         if self.wandb_run:
-            for lname in self.my_layers_to_train:
-                safe = lname.replace("/", "_")
+            for lv in self.my_lv_keys:
+                safe = self._safe_key(lv)
                 # step 축
                 self.wandb_run.define_metric(f"{safe}/step")
                 # token 축
                 self.wandb_run.define_metric(f"{safe}/token_seen")
-                
+
                 # 접두 네임스페이스로 축 매핑
                 self.wandb_run.define_metric(f"{safe}/by_step/*",  step_metric=f"{safe}/step",       step_sync=True)
                 self.wandb_run.define_metric(f"{safe}/by_token/*", step_metric=f"{safe}/token_seen", step_sync=True)
@@ -679,6 +1007,8 @@ class SAETrainingPipeline:
                 self.wandb_run.define_metric(f"{safe}/by_step/loss", summary="min")
                 # validation 지표(step 축 공유)
                 self.wandb_run.define_metric(f"{safe}/val/*", step_metric=f"{safe}/step", step_sync=True)
+                self.wandb_run.define_metric(f"{safe}/val_out/*", step_metric=f"{safe}/step", step_sync=True)
+                self.wandb_run.define_metric(f"{safe}/e2e/*", step_metric=f"{safe}/step", step_sync=True)
 
                 # 초기값 0 (축 고정)
                 self._wandb_log({f"{safe}/step": 0, f"{safe}/token_seen": 0})
@@ -688,100 +1018,141 @@ class SAETrainingPipeline:
             logger.info(f"Available SAE types: {available_types}")
         device = self.device
 
-        # SAE 인스턴스 생성(오너 레이어만)
-        for layer_name in self.my_layers_to_train:
-            act_size = self.activation_store.get_activation_size(layer_name)
+        # Eagerly offload each SAE to CPU right after creation to avoid OOM when
+        # creating many large SAEs (RA-SAE W matrix = [dict_size, n_clusters] can be
+        # 2+ GB per SAE; post-loop offload is too late for multi-layer experiments).
+        offload = bool(self.config["sae"]["training"].get("offload_inactive_variants", False))
+
+        # SAE 인스턴스 생성(오너 레이어만) — 레이어×변형(variant) 조합마다 생성
+        _ra_types = [
+            "ra-topk", "ra-ar", "ra-jump", "ra-jumprelu",
+            "ra-batchtopk", "ra-unitcentroid-batchtopk",
+        ]
+        for lname in self.my_layers_to_train:
+            act_size = self.activation_store.get_activation_size(lname)
             tr = sae_cfg_all["training"]
-            layer_over = tr.get("per_layer", {}).get(layer_name, {})
-            sae_type = layer_over.get("sae_type", tr.get("sae_type", "batch-topk")).lower()
+            layer_over = tr.get("per_layer", {}).get(lname, {})
 
-            expansion = layer_over.get("expansion_factor", tr.get("expansion_factor", 8))
-            sae_cfg = {
-                "act_size": act_size,
-                "dict_size": layer_over.get("dict_size", act_size * expansion),
-                "device": str(device),
-                "dtype": tr.get("dtype", "float32"),
-                "seed": tr.get("seed", 42),
-                "l1_coeff": layer_over.get("l1_coeff", tr.get("l1_coeff", 0.0)),
-                "input_unit_norm": tr.get("input_unit_norm", True),
-                "n_batches_to_dead": tr.get("n_batches_to_dead", 20),
-                # Common hyperparams (global defaults, overridable by per-layer)
-                "k": tr.get("k", 32),
-                "k_aux": tr.get("k_aux", 512),
-                "aux_frac": tr.get("aux_frac", 0.1),
-                # Loss selection & penalty (read by _resolve_loss_name / _get_aux_penalty)
-                "loss_name": layer_over.get("loss_name", tr.get("loss_name", "mse_l1")),
-                "aux_penalty": layer_over.get("aux_penalty", tr.get("aux_penalty", 0.1)),
-                # Freq / bias monitoring & penalty
-                "freq_ema_decay": tr.get("freq_ema_decay", 0.999),
-                "spatial_var_penalty": tr.get("spatial_var_penalty", 0.0),
-                "spatial_var_freq_threshold": tr.get("spatial_var_freq_threshold", 0.01),
-                "freq_penalty_coeff": tr.get("freq_penalty_coeff", 0.0),
-                "bev_penalty": tr.get("bev_penalty", 0.0),
-                # RA-SAE specific
-                "input_global_center_norm": tr.get("input_global_center_norm", False),
-                "delta": tr.get("delta", 0.5),
-                "reanim_coeff": tr.get("reanim_coeff", 0.0),
-                "nmse_weight": tr.get("nmse_weight", 0.0),
-                **{k: v for k, v in layer_over.items() if k not in ("sae_type",)},
-            }
+            for var_cfg in self._variants_for_layer(lname):
+                vname = var_cfg.get("name", "default")
+                lv = self._lv_key(lname, vname)
+                # Variant overrides take priority over per-layer overrides
+                var_over = {k: v for k, v in var_cfg.items() if k != "name"}
+                merged_over = {**layer_over, **var_over}
 
-            # RA-SAE specific: load cluster centers
-            _ra_types = [
-                "ra-topk", "ra-ar", "ra-jump", "ra-jumprelu",
-                "ra-batchtopk", "ra-unitcentroid-batchtopk",
-            ]
-            if sae_type in _ra_types:
-                points = self._load_kmeans_centers(layer_name, act_size)
-                sae_cfg["points"] = points
-                # Load global_mean for unit-centroid variant
-                if sae_type == "ra-unitcentroid-batchtopk":
-                    global_mean = self._load_global_mean(layer_name, act_size)
-                    if global_mean is not None:
-                        sae_cfg["global_mean"] = global_mean
+                sae_type = merged_over.get("sae_type", tr.get("sae_type", "batch-topk")).lower()
 
-            if sae_type in ["topk", "top_k"]:
-                sae_cfg.update({"top_k": tr["k"], "top_k_aux": tr.get("k_aux", 512), "aux_frac": tr.get("aux_frac", 1/32)})
-                sae = create_sae("topk", sae_cfg)
-            elif sae_type in ["vanilla", "standard"]:
-                sae = create_sae("vanilla", sae_cfg)
-            elif sae_type in ["batch-topk", "batchtopk", "batch_topk"]:
-                sae_cfg.update({"k": tr["k"], "k_aux": tr.get("k_aux", 512), "aux_frac": tr.get("aux_frac", 1/32),
-                                "batch_size": tr.get("activation_batch_size", 4096)})
-                sae = create_sae("batch-topk", sae_cfg)
-            elif sae_type in ["matryoshka"]:
-                sae_cfg.update({"group_sizes": tr.get("group_sizes", [sae_cfg["dict_size"]]),
-                                "k": tr["k"], "aux_frac": tr.get("aux_frac", 1/32)})
-                sae = create_sae("matryoshka", sae_cfg)
-            else:
-                sae = create_sae(sae_type, sae_cfg)
+                expansion = merged_over.get("expansion_factor", tr.get("expansion_factor", 8))
+                sae_cfg = {
+                    "act_size": act_size,
+                    "dict_size": merged_over.get("dict_size", act_size * expansion),
+                    "device": str(device),
+                    "dtype": tr.get("dtype", "float32"),
+                    "seed": tr.get("seed", 42),
+                    "l1_coeff": merged_over.get("l1_coeff", tr.get("l1_coeff", 0.0)),
+                    "input_unit_norm": tr.get("input_unit_norm", True),
+                    "n_batches_to_dead": tr.get("n_batches_to_dead", 20),
+                    # Common hyperparams (global defaults, overridable by per-layer/variant)
+                    "k": merged_over.get("k", tr.get("k", 32)),
+                    "k_aux": merged_over.get("k_aux", tr.get("k_aux", 512)),
+                    "aux_frac": merged_over.get("aux_frac", tr.get("aux_frac", 0.1)),
+                    # Loss selection & penalty (read by _resolve_loss_name / _get_aux_penalty)
+                    "loss_name": merged_over.get("loss_name", tr.get("loss_name", "mse_l1")),
+                    "aux_penalty": merged_over.get("aux_penalty", tr.get("aux_penalty", 0.1)),
+                    # Freq / bias monitoring & penalty
+                    "freq_ema_decay": tr.get("freq_ema_decay", 0.999),
+                    "spatial_var_penalty": merged_over.get("spatial_var_penalty", tr.get("spatial_var_penalty", 0.0)),
+                    "spatial_var_freq_threshold": tr.get("spatial_var_freq_threshold", 0.01),
+                    "freq_penalty_coeff": merged_over.get("freq_penalty_coeff", tr.get("freq_penalty_coeff", 0.0)),
+                    "bev_penalty": merged_over.get("bev_penalty", tr.get("bev_penalty", 0.0)),
+                    # RA-SAE specific
+                    "input_global_center_norm": tr.get("input_global_center_norm", False),
+                    "delta": merged_over.get("delta", tr.get("delta", 0.5)),
+                    "reanim_coeff": merged_over.get("reanim_coeff", tr.get("reanim_coeff", 0.0)),
+                    "nmse_weight": merged_over.get("nmse_weight", tr.get("nmse_weight", 0.0)),
+                    **{k: v for k, v in merged_over.items() if k not in ("sae_type",)},
+                }
 
-            sae.to(device)
-            sae.train()
+                # RA-SAE specific: load cluster centers
+                if sae_type in _ra_types:
+                    points = self._load_kmeans_centers(lname, act_size)
+                    sae_cfg["points"] = points
+                    # Load global_mean for unit-centroid variant
+                    if sae_type == "ra-unitcentroid-batchtopk":
+                        global_mean = self._load_global_mean(lname, act_size)
+                        if global_mean is not None:
+                            sae_cfg["global_mean"] = global_mean
 
-            # b_dec initialization from global_mean
-            b_dec_init = layer_over.get("b_dec_init", tr.get("b_dec_init", "zeros"))
-            if b_dec_init == "mean" and sae_type in _ra_types:
-                global_mean = self._load_global_mean(layer_name, act_size)
-                if global_mean is not None:
-                    sae.b_dec.data.copy_(global_mean.to(device))
-                    logger.info(f"[Rank {self.rank}] Initialized b_dec from global_mean for {layer_name}")
+                if sae_type in ["topk", "top_k"]:
+                    sae_cfg.update({"top_k": sae_cfg["k"], "top_k_aux": sae_cfg["k_aux"], "aux_frac": sae_cfg["aux_frac"]})
+                    sae = create_sae("topk", sae_cfg)
+                elif sae_type in ["vanilla", "standard"]:
+                    sae = create_sae("vanilla", sae_cfg)
+                elif sae_type in ["batch-topk", "batchtopk", "batch_topk"]:
+                    sae_cfg.update({"k": sae_cfg["k"], "k_aux": sae_cfg["k_aux"], "aux_frac": sae_cfg["aux_frac"],
+                                    "batch_size": tr.get("activation_batch_size", 4096)})
+                    sae = create_sae("batch-topk", sae_cfg)
+                elif sae_type in ["matryoshka"]:
+                    sae_cfg.update({"group_sizes": tr.get("group_sizes", [sae_cfg["dict_size"]]),
+                                    "k": sae_cfg["k"], "aux_frac": sae_cfg["aux_frac"]})
+                    sae = create_sae("matryoshka", sae_cfg)
                 else:
-                    logger.warning(
-                        f"[Rank {self.rank}] b_dec_init='mean' but no global_mean found for {layer_name}. "
-                        "Using zeros. Run K-means with --unit-norm first."
-                    )
+                    sae = create_sae(sae_type, sae_cfg)
 
-            # b_norm initialization from centroid mean (mean direction on unit sphere)
-            if hasattr(sae, "b_norm") and sae_type in _ra_types:
-                points = sae_cfg.get("points")
-                if points is not None:
-                    centroid_mean = points.mean(dim=0)
-                    sae.b_norm.data.copy_(centroid_mean.to(device))
-                    logger.info(f"[Rank {self.rank}] Initialized b_norm from centroid mean for {layer_name}")
+                sae.to(device)
+                sae.train()
 
-            self.sae_models[layer_name] = sae
-            logger.info(f"[Rank {self.rank}] Created SAE({sae_type}) for {layer_name} (act={act_size})")
+                # b_dec initialization from global_mean
+                b_dec_init = merged_over.get("b_dec_init", tr.get("b_dec_init", "zeros"))
+                if b_dec_init == "mean":
+                    global_mean = self._load_global_mean(lname, act_size)
+                    if global_mean is not None:
+                        sae.b_dec.data.copy_(global_mean.to(device))
+                        logger.info(f"[Rank {self.rank}] Initialized b_dec from global_mean for {lv}")
+                    else:
+                        logger.warning(
+                            f"[Rank {self.rank}] b_dec_init='mean' but no global_mean found for {lv}. "
+                            "Using zeros. Run K-means with --unit-norm first."
+                        )
+
+                # b_norm initialization: must be in unit-sphere space (centroid mean).
+                # Use centroid mean for all SAE types — centroids are unit-normalized
+                # (saved by kmeans --unit-norm), so their mean is the mean direction on
+                # the sphere. Raw global_mean is in original space and must NOT be used.
+                if hasattr(sae, "b_norm"):
+                    points = sae_cfg.get("points")
+                    if points is None:
+                        # Non-RA types don't load centroids for W; load them just for b_norm.
+                        try:
+                            points = self._load_kmeans_centers(lname, act_size)
+                        except Exception:
+                            points = None
+                    if points is not None:
+                        centroid_mean = points.mean(dim=0)
+                        sae.b_norm.data.copy_(centroid_mean.to(device))
+                        logger.info(f"[Rank {self.rank}] Initialized b_norm from centroid mean for {lv}")
+
+                self.sae_models[lv] = sae
+                logger.info(f"[Rank {self.rank}] Created SAE({sae_type}) variant='{vname}' for '{lname}' (act={act_size})")
+
+                # Immediately offload to CPU after creation+init to cap peak VRAM.
+                if offload:
+                    sae.cpu()
+                    torch.cuda.empty_cache()
+                    logger.debug("[offload] Offloaded %s to CPU immediately after creation", lv)
+
+        # If offload_inactive_variants is enabled, restore ONLY the first variant
+        # of each layer to GPU (all variants were offloaded during creation above).
+        if offload:
+            for lname in self.my_layers_to_train:
+                lvs_for_layer = [lv for lv in self.my_lv_keys if self._lv_parse(lv)[0] == lname]
+                if lvs_for_layer:
+                    first_sae = self.sae_models.get(lvs_for_layer[0])
+                    if first_sae is not None:
+                        first_sae.to(device)
+                        logger.debug("[offload] Restored first variant %s to GPU", lvs_for_layer[0])
+            torch.cuda.empty_cache()
+            logger.info("[Rank %d] Pre-offloaded inactive variants to CPU (offload_inactive_variants=True)", self.rank)
 
     def _load_kmeans_centers(self, layer_name: str, act_size: int) -> torch.Tensor:
         """Load pre-computed K-means cluster centers for RA-SAE initialization.
@@ -1023,8 +1394,6 @@ class SAETrainingPipeline:
     def _run_validation(self, steps_done: Dict[str, int]) -> None:
         if not (self.validation_ready and self.validation_cfg.get("enabled", False)):
             return
-        if not self.wandb_run:
-            return
         eval_bs = int(
             self.validation_cfg.get(
                 "eval_batch_tokens",
@@ -1034,11 +1403,20 @@ class SAETrainingPipeline:
         global_step = max(steps_done.values()) if steps_done else 0
         logged_any = False
 
-        for lname, cache in self.validation_cache.items():
-            sae = self.sae_models.get(lname)
+        for lv in self.my_lv_keys:
+            lname, _ = self._lv_parse(lv)
+            cache = self.validation_cache.get(lname)
+            if cache is None:
+                continue
+            sae = self.sae_models.get(lv)
             if sae is None:
                 continue
             was_train = sae.training
+            orig_device = self._module_device(sae)
+            moved = False
+            if orig_device != self.device:
+                sae.to(self.device)
+                moved = True
             sae.eval()
 
             total = 0
@@ -1058,13 +1436,15 @@ class SAETrainingPipeline:
                     max_l2 = max(max_l2, l2)
             if was_train:
                 sae.train()
+            if moved:
+                sae.to(orig_device)
             if total == 0:
                 continue
 
-            safe = lname.replace("/", "_")
+            safe = self._safe_key(lv)
             payload = {
                 "global/step": global_step,
-                f"{safe}/step": steps_done.get(lname, 0),
+                f"{safe}/step": steps_done.get(lv, 0),
                 f"{safe}/val/loss": sum_loss / total,
                 f"{safe}/val/l2_mean": sum_l2 / total,
                 f"{safe}/val/l2_max": max_l2,
@@ -1072,31 +1452,160 @@ class SAETrainingPipeline:
                 f"{safe}/val/aux_mean": sum_aux / total,
                 f"{safe}/val/tokens": total,
             }
-            self._wandb_log(payload, commit=False)
+            if self.wandb_run:
+                self._wandb_log(payload, commit=False)
+            else:
+                logger.info("[val] %s loss=%.5f l2=%.5f aux=%.5f tokens=%d",
+                            lv, payload[f"{safe}/val/loss"], payload[f"{safe}/val/l2_mean"],
+                            payload[f"{safe}/val/aux_mean"], total)
             logged_any = True
 
-        if logged_any:
+        self._run_output_validation(steps_done)
+
+        if logged_any and self.wandb_run:
             self._wandb_log({}, commit=True)
 
+    def _run_output_validation(self, steps_done: Dict[str, int]) -> None:
+        out_cfg = dict(self.validation_cfg.get("output_metrics") or {})
+        if not out_cfg.get("enabled", False):
+            return
+
+        loader = self._build_validation_loader()
+        if loader is None:
+            return
+
+        max_batches = int(out_cfg.get("max_batches", 1))
+        global_step = max(steps_done.values()) if steps_done else 0
+        sums: dict[str, dict[str, float]] = {
+            lv: {
+                "logit_mse": 0.0,
+                "logit_kl": 0.0,
+                "delta_ce": 0.0,
+                "orig_ce": 0.0,
+                "recon_ce": 0.0,
+                "top1_consistency": 0.0,
+                "orig_acc": 0.0,
+                "recon_acc": 0.0,
+                "delta_acc": 0.0,
+                "count": 0.0,
+            }
+            for lv in self.my_lv_keys
+        }
+
+        for batch_idx, raw_batch in enumerate(loader):
+            if max_batches > 0 and batch_idx >= max_batches:
+                break
+            batch = self._move_batch_to_device(raw_batch, self.device)
+            with torch.no_grad():
+                orig_logits = self._forward_model_logits(
+                    batch,
+                    enable_grad=False,
+                    disable_store_capture=True,
+                )
+            if orig_logits is None:
+                logger.warning("Output validation skipped: model forward did not return logits.")
+                return
+
+            labels = self._extract_labels(batch)
+            orig_ce = None
+            orig_pred = None
+            if labels is not None and labels.ndim == 1 and orig_logits.ndim == 2:
+                orig_ce = F.cross_entropy(orig_logits, labels)
+                orig_pred = orig_logits.argmax(dim=-1)
+
+            for lv in self.my_lv_keys:
+                sae = self.sae_models.get(lv)
+                if sae is None:
+                    continue
+                orig_device = self._module_device(sae)
+                moved = False
+                if orig_device != self.device:
+                    sae.to(self.device)
+                    moved = True
+                try:
+                    recon_logits, _ = self._run_sae_recon_forward(
+                        lv,
+                        batch,
+                        add_error=False,
+                        enable_grad=False,
+                    )
+                finally:
+                    if moved:
+                        sae.to(orig_device)
+                if recon_logits is None:
+                    continue
+
+                acc = sums[lv]
+                acc["logit_mse"] += float(F.mse_loss(recon_logits.float(), orig_logits.float()).item())
+                acc["logit_kl"] += float(self._logits_kl_loss(recon_logits, orig_logits).item())
+                if recon_logits.ndim >= 2 and orig_logits.shape == recon_logits.shape:
+                    recon_pred = recon_logits.argmax(dim=-1)
+                    acc["top1_consistency"] += float((orig_pred == recon_pred).float().mean().item()) if orig_pred is not None else float((orig_logits.argmax(dim=-1) == recon_pred).float().mean().item())
+                if orig_ce is not None:
+                    recon_ce = F.cross_entropy(recon_logits, labels)
+                    recon_pred = recon_logits.argmax(dim=-1)
+                    orig_acc = (orig_pred == labels).float().mean()
+                    recon_acc = (recon_pred == labels).float().mean()
+                    acc["orig_ce"] += float(orig_ce.item())
+                    acc["recon_ce"] += float(recon_ce.item())
+                    acc["delta_ce"] += float((recon_ce - orig_ce).item())
+                    acc["orig_acc"] += float(orig_acc.item())
+                    acc["recon_acc"] += float(recon_acc.item())
+                    acc["delta_acc"] += float((recon_acc - orig_acc).item())
+                acc["count"] += 1.0
+
+        payload: dict[str, float] = {"global/step": global_step}
+        logged_any = False
+        for lv, acc in sums.items():
+            count = int(acc["count"])
+            if count == 0:
+                continue
+            safe = self._safe_key(lv)
+            payload[f"{safe}/step"] = steps_done.get(lv, 0)
+            payload[f"{safe}/val_out/logit_mse"] = acc["logit_mse"] / count
+            payload[f"{safe}/val_out/logit_kl"] = acc["logit_kl"] / count
+            payload[f"{safe}/val_out/top1_consistency"] = acc["top1_consistency"] / count
+            if acc["orig_ce"] > 0 or acc["recon_ce"] > 0:
+                payload[f"{safe}/val_out/orig_ce"] = acc["orig_ce"] / count
+                payload[f"{safe}/val_out/recon_ce"] = acc["recon_ce"] / count
+                payload[f"{safe}/val_out/delta_ce"] = acc["delta_ce"] / count
+                payload[f"{safe}/val_out/orig_acc"] = acc["orig_acc"] / count
+                payload[f"{safe}/val_out/recon_acc"] = acc["recon_acc"] / count
+                payload[f"{safe}/val_out/delta_acc"] = acc["delta_acc"] / count
+            logger.info(
+                "[val_out] %s logit_mse=%.6f logit_kl=%.6f top1_consistency=%.6f%s",
+                lv,
+                acc["logit_mse"] / count,
+                acc["logit_kl"] / count,
+                acc["top1_consistency"] / count,
+                f" delta_ce={acc['delta_ce'] / count:.6f}" if acc["orig_ce"] > 0 or acc["recon_ce"] > 0 else "",
+            )
+            logged_any = True
+
+        if logged_any and self.wandb_run:
+            self._wandb_log(payload)
+
     # ------------------------------- ckpt --------------------------------
-    def _save_layer_ckpt(self, lname: str, step: int, opt, tokens_seen: int):
-        save_root = Path(self.config["sae"]["output"]["save_path"])
-        layer_dir = save_root / sanitize_layer_name(lname)
+    def _save_layer_ckpt(self, lv_key: str, step: int, opt, tokens_seen: int):
+        lname, vname = self._lv_parse(lv_key)
+        layer_dir = self._ckpt_dir_for(lname, vname)
         layer_dir.mkdir(parents=True, exist_ok=True)
         path = layer_dir / f"step_{step:07d}_tokens_{tokens_seen}.pt"
 
-        sae_config = dict(self.sae_models[lname].config)
+        sae_config = dict(self.sae_models[lv_key].config)
         # Ensure sae_type is saved for correct reload
         if "sae_type" not in sae_config or not sae_config["sae_type"]:
             tr_cfg = self.config.get("sae", {}).get("training", {})
             sae_config["sae_type"] = tr_cfg.get("sae_type", "batch-topk")
         pkg = {
             "layer_name": lname,
+            "variant_name": vname,
+            "lv_key": lv_key,
             "owner_rank": self.rank,
             "world_size": self.world_size,
             "step": step,
             "tokens_seen": tokens_seen,
-            "sae_state": self.sae_models[lname].state_dict(),
+            "sae_state": self.sae_models[lv_key].state_dict(),
             "optimizer_state": opt.state_dict(),
             "sae_config": sae_config,
             "act_size": self.activation_store.get_activation_size(lname),
@@ -1115,8 +1624,9 @@ class SAETrainingPipeline:
                     logger.info(f"[Rank {self.rank}] Deleted old ckpt: {old.name}")
 
         # 선택: W&B artifact 업로드
+        art_name = lv_key.replace(':', '__').replace('/', '_').replace('@@', '__')
         if self.wandb_run and self.wandb_cfg.get("upload_checkpoints", False):
-            art = wandb.Artifact(name=f"sae_{lname.replace(':','__').replace('/','_')}", type="model")
+            art = wandb.Artifact(name=f"sae_{art_name}", type="model")
             art.add_file(str(path))
             self.wandb_run.log_artifact(art)
 
@@ -1165,25 +1675,23 @@ class SAETrainingPipeline:
             self.rank, data_dir, epochs, default_batch_size, do_shuffle,
         )
 
-        for lname in self.my_layers_to_train:
+        for lv in self.my_lv_keys:
+            lname, vname = self._lv_parse(lv)
             # Skip if already past warmup (resumed from checkpoint)
-            if steps_done.get(lname, 0) > 0:
+            if steps_done.get(lv, 0) > 0:
                 logger.info(
                     "[Rank %d] Skipping warmup for %s — already at step %d",
-                    self.rank, lname, steps_done[lname],
+                    self.rank, lv, steps_done[lv],
                 )
                 continue
 
-            sae = self.sae_models[lname]
-            opt = opt_for[lname]
-            sched = sched_for[lname]
+            sae = self.sae_models[lv]
+            opt = opt_for[lv]
+            sched = sched_for[lv]
 
-            # Determine per-layer batch size
-            per_layer_cfg = tr_cfg.get("per_layer", {}).get(lname, {})
-            train_bs = int(per_layer_cfg.get("batch_size", default_batch_size))
-
-            # Grad clipping config
-            clip_grad = float(per_layer_cfg.get("clip_grad", tr_cfg.get("clip_grad", 1.0)))
+            cfg_lv = self._runtime_cfg_for_lv(lv)
+            train_bs = int(cfg_lv.get("batch_size", default_batch_size))
+            clip_grad = float(cfg_lv.get("clip_grad", tr_cfg.get("clip_grad", 1.0)))
 
             # Locate chunk files for this layer
             safe_lname = sanitize_layer_name(lname)
@@ -1240,7 +1748,7 @@ class SAETrainingPipeline:
 
                 # Process chunks in groups of effective_buf
                 for group_start in range(0, len(epoch_paths), effective_buf):
-                    if steps_done[lname] >= warmup_max_steps:
+                    if steps_done[lv] >= warmup_max_steps:
                         break
 
                     group = epoch_paths[group_start:group_start + effective_buf]
@@ -1272,7 +1780,7 @@ class SAETrainingPipeline:
 
                     # Train on batches from the shuffled pool
                     for start in range(0, n_pool, train_bs):
-                        if steps_done[lname] >= warmup_max_steps:
+                        if steps_done[lv] >= warmup_max_steps:
                             break
 
                         end = min(start + train_bs, n_pool)
@@ -1297,8 +1805,8 @@ class SAETrainingPipeline:
                         if hasattr(sae, "make_decoder_weights_and_grad_unit_norm"):
                             sae.make_decoder_weights_and_grad_unit_norm()
 
-                        steps_done[lname] += 1
-                        self.tokens_seen[lname] += actual_bs
+                        steps_done[lv] += 1
+                        self.tokens_seen[lv] += actual_bs
                         total_warmup_tokens += actual_bs
 
                         loss_val, l1_val, l2_val, aux_val = self._extract_losses(out)
@@ -1316,9 +1824,9 @@ class SAETrainingPipeline:
                         if speed_log_sec > 0 and (time.time() - speed_t0) >= speed_log_sec:
                             tps = speed_tokens / max(speed_elapsed, 1e-6)
                             print(
-                                f"[warmup] {lname} rank={self.rank} "
+                                f"[warmup] {lv} rank={self.rank} "
                                 f"epoch={epoch+1}/{epochs} "
-                                f"step={steps_done[lname]} "
+                                f"step={steps_done[lv]} "
                                 f"tokens/s={tps:,.0f} "
                                 f"loss={loss_val:.5f} l2={l2_val:.5f} aux={aux_val:.5f} "
                                 f"rel_l2={_rel_l2:.5f} sparsity={_sparsity:.6f}",
@@ -1329,17 +1837,17 @@ class SAETrainingPipeline:
                             speed_t0 = time.time()
 
                         # W&B logging
-                        if self.wandb_run and log_every > 0 and (steps_done[lname] % log_every == 0):
-                            safe = lname.replace("/", "_")
+                        if self.wandb_run and log_every > 0 and (steps_done[lv] % log_every == 0):
+                            safe = self._safe_key(lv)
                             # dead feature stats
                             _cnt = sae.num_batches_not_active
                             _n_dead_th = sae.config.get("n_batches_to_dead", 20)
                             _dead_frac = float((_cnt > _n_dead_th).float().mean().item())
-                            _never_frac = float((_cnt >= steps_done[lname]).float().mean().item())
+                            _never_frac = float((_cnt >= steps_done[lv]).float().mean().item())
 
                             payload = {
-                                f"{safe}/step": steps_done[lname],
-                                f"{safe}/token_seen": self.tokens_seen[lname],
+                                f"{safe}/step": steps_done[lv],
+                                f"{safe}/token_seen": self.tokens_seen[lv],
                                 f"warmup/{safe}/loss": loss_val,
                                 f"warmup/{safe}/l2": l2_val,
                                 f"warmup/{safe}/l1": l1_val,
@@ -1388,30 +1896,30 @@ class SAETrainingPipeline:
                             self._wandb_log(payload)
 
                         # Checkpoint saving
-                        if ckpt_every > 0 and (steps_done[lname] % ckpt_every == 0):
+                        if ckpt_every > 0 and (steps_done[lv] % ckpt_every == 0):
                             self._save_layer_ckpt(
-                                lname, steps_done[lname], opt, self.tokens_seen[lname],
+                                lv, steps_done[lv], opt, self.tokens_seen[lv],
                             )
 
                     del pool
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-                if steps_done[lname] >= warmup_max_steps:
+                if steps_done[lv] >= warmup_max_steps:
                     break
 
             # --- warmup 완료 후 dead feature 통계 ---
-            sae = self.sae_models[lname]
+            sae = self.sae_models[lv]
             n_dead_thresh = sae.config.get("n_batches_to_dead", 20)
             cnt = sae.num_batches_not_active
-            never_active = int((cnt >= steps_done[lname]).sum().item())  # warmup 내내 한번도 안 쓰인 feature
+            never_active = int((cnt >= steps_done[lv]).sum().item())  # warmup 내내 한번도 안 쓰인 feature
             dead_now = int((cnt > n_dead_thresh).sum().item())
             total_features = cnt.numel()
             logger.info(
                 "[Rank %d] Warmup done for %s: steps=%d, tokens=%s, mode=%s | "
                 "features: total=%d, never_activated=%d (%.1f%%), "
                 "dead(>%d)=%d (%.1f%%)",
-                self.rank, lname, steps_done[lname],
+                self.rank, lv, steps_done[lv],
                 self._fmt_num(total_warmup_tokens), load_mode,
                 total_features,
                 never_active, 100.0 * never_active / max(total_features, 1),
@@ -1485,8 +1993,8 @@ class SAETrainingPipeline:
         hist_every = int(self.wandb_cfg.get("log_hist_every_steps", 1000)) if self.wandb_run else 0
         speed_log_sec = float(tr_cfg.get("speed_log_every_sec", 0.0))
         
-        opt_for = {lname: torch.optim.Adam(self.sae_models[lname].parameters(), lr=lr)
-                   for lname in self.my_layers_to_train}
+        opt_for = {lv: torch.optim.Adam(self.sae_models[lv].parameters(), lr=lr)
+                   for lv in self.my_lv_keys}
 
         steps_goal = int(tr_cfg.get("num_training_steps", 10000))  # 레이어별 목표 step
 
@@ -1494,23 +2002,23 @@ class SAETrainingPipeline:
         lr_final = float(tr_cfg.get("lr_final", 0.0))
         warmup_steps = int(tr_cfg.get("warmup_steps", 0))
         sched_for = {
-            lname: CosineScheduler(
-                optimizer=opt_for[lname],
+            lv: CosineScheduler(
+                optimizer=opt_for[lv],
                 base_value=lr,
                 final_value=lr_final,
                 total_iters=steps_goal,
                 warmup_iters=warmup_steps,
                 start_warmup_value=0.0,
             )
-            for lname in self.my_layers_to_train
+            for lv in self.my_lv_keys
         }
-        steps_done: Dict[str, int] = {ln: 0 for ln in self.my_layers_to_train}
-        self.tokens_seen = {ln: 0 for ln in self.my_layers_to_train}
-        speed_track = {ln: {"tokens": 0, "elapsed": 0.0, "steps": 0} for ln in self.my_layers_to_train}
+        steps_done: Dict[str, int] = {lv: 0 for lv in self.my_lv_keys}
+        self.tokens_seen = {lv: 0 for lv in self.my_lv_keys}
+        speed_track = {lv: {"tokens": 0, "elapsed": 0.0, "steps": 0} for lv in self.my_lv_keys}
         self._resume_from_checkpoints(opt_for, steps_done)
         # Fast-forward schedulers to resumed step
-        for lname in self.my_layers_to_train:
-            sched_for[lname].iter = steps_done[lname]
+        for lv in self.my_lv_keys:
+            sched_for[lv].iter = steps_done[lv]
         # === Offline warmup from pre-extracted cache ===
         self._log_gpu_memory("before_warmup")
         self._run_warmup_from_cache(opt_for, sched_for, steps_done)
@@ -1526,22 +2034,28 @@ class SAETrainingPipeline:
             global_step = max(steps_done.values()) if steps_done else 0
 
             # 오너 레이어에 대해서만 학습 시도
-            for lname in list(self.my_layers_to_train):
-                if steps_done[lname] >= steps_goal:
+            for lv in list(self.my_lv_keys):
+                lname, vname = self._lv_parse(lv)
+                if steps_done[lv] >= steps_goal:
                     continue
 
-                sae = self.sae_models[lname]
-                opt = opt_for[lname]
+                sae = self.sae_models[lv]
+                opt = opt_for[lv]
 
-                cfg_l = self.activation_store._cfg_for_layer(lname)
-                train_bs = int(cfg_l.get("batch_size", self.activation_store.activation_batch_size))  # SAE 목표 배치(토큰) 수
-                micro    = int(cfg_l.get("micro", train_bs))  # micro가 없으면 train_bs와 동일 → 기존 동작
+                cfg_lv = self._runtime_cfg_for_lv(lv)
+                train_bs = int(cfg_lv.get("batch_size", self.activation_store.activation_batch_size))  # SAE 목표 배치(토큰) 수
+                micro    = int(cfg_lv.get("micro", train_bs))  # micro가 없으면 train_bs와 동일 → 기존 동작
                 # micro로 몇 번 쪼개서 누적할지(기본: ceil(train_bs / micro)), 사용자가 'accum'을 주면 우선
                 default_accum = (train_bs + micro - 1) // micro
-                accum    = int(cfg_l.get("accum", default_accum))
+                accum    = int(cfg_lv.get("accum", default_accum))
 
                 # 큐에 남은 토큰 기반으로 이번 사이클에 최대 몇 스텝을 돌릴지 결정
-                q = getattr(self.activation_store, "queues", {}).get(lname) if self.activation_store else None
+                # Check variant queue tokens (for budget calculation)
+                if vname != "default" and self.activation_store:
+                    var_qs = getattr(self.activation_store, "variant_queues", {})
+                    q = var_qs.get(lname, {}).get(vname)
+                else:
+                    q = getattr(self.activation_store, "queues", {}).get(lname) if self.activation_store else None
                 queue_tokens = int(getattr(q, "ntoks", 0))
                 # Mixing buffer에 있는 토큰도 available로 카운트
                 mb = getattr(self.activation_store, "mix_buffers", {}).get(lname)
@@ -1554,8 +2068,33 @@ class SAETrainingPipeline:
                     steps_budget = min(steps_budget, max(1, queue_tokens // max(train_bs, 1)))
                 steps_budget = max(1, steps_budget)
 
+                # --- CPU offload: move other variants of same layer to CPU to save memory ---
+                offload = bool(tr_cfg.get("offload_inactive_variants", False))
+                if offload:
+                    for other_lv in self.my_lv_keys:
+                        if self._lv_parse(other_lv)[0] == lname and other_lv != lv:
+                            other_sae = self.sae_models.get(other_lv)
+                            if other_sae is not None:
+                                p = next(iter(other_sae.parameters()), None)
+                                if p is not None and p.device.type != "cpu":
+                                    other_sae.cpu()
+                                    # Move optimizer state to CPU too — RA-SAE W is [dict_size,
+                                    # n_clusters] (~2.3GB), so Adam m+v = ~4.6GB that accumulates
+                                    # across variants if left on GPU.
+                                    opt_other = opt_for.get(other_lv)
+                                    if opt_other is not None and opt_other.state:
+                                        self._move_optimizer_state_to_device(opt_other, torch.device("cpu"))
+                                    logger.debug("[offload] Moved %s + opt state to CPU (training %s)", other_lv, lv)
+                # Ensure current variant is on device
+                p = next(iter(sae.parameters()), None)
+                if p is not None and p.device != self.device:
+                    sae.to(self.device)
+                    if opt_for[lv].state:
+                        self._move_optimizer_state_to_device(opt_for[lv], self.device)
+                    logger.debug("[offload] Restored %s to %s", lv, self.device)
+
                 steps_this_cycle = 0
-                while steps_done[lname] < steps_goal and steps_this_cycle < steps_budget:
+                while steps_done[lv] < steps_goal and steps_this_cycle < steps_budget:
                     step_t0 = time.time()
                     opt.zero_grad(set_to_none=True)
                     tokens_accum = 0
@@ -1576,10 +2115,14 @@ class SAETrainingPipeline:
 
                     # spatial variance diagnostics (last micro-batch snapshot)
                     _last_bev = None; _last_nhf = None
+                    e2e_stats: dict[str, float] = {}
 
                     while tokens_accum < train_bs and chunks_done < accum:
                         need = min(micro, train_bs - tokens_accum)
-                        acts = self.activation_store.next_batch(lname, batch_size=need)
+                        acts = self.activation_store.next_batch(
+                            lname, batch_size=need,
+                            variant=(vname if vname != "default" else None),
+                        )
                         if acts is None or acts.numel() == 0:
                             break
                         out = sae(acts)
@@ -1637,36 +2180,72 @@ class SAETrainingPipeline:
                             _last_bev = float(out.get("bias_explained_var", torch.tensor(0.)).item()) if "bias_explained_var" in out else None
                             _last_nhf = int(out.get("n_high_freq", 0)) if "n_high_freq" in out else None
 
+                        # Compute bias metrics from feature_freq_ema for all SAE models
+                        if hasattr(sae, "feature_freq_ema"):
+                            with torch.no_grad():
+                                freq = sae.feature_freq_ema.float()
+                                freq_thr = float(sae.config.get("spatial_var_freq_threshold", 0.9))
+                                high_freq_mask = freq > freq_thr
+                                _last_nhf = int(high_freq_mask.sum().item())
+                                # bias_explained_var: only if out has sae_out and we have acts
+                                if _last_bev is None and isinstance(out, dict) and "sae_out" in out and "feature_acts" in out:
+                                    try:
+                                        f_acts = out["feature_acts"].reshape(-1, freq.shape[0])
+                                        if high_freq_mask.any():
+                                            W_dec = sae.get_dictionary() if hasattr(sae, "get_dictionary") else sae.W_dec.T
+                                            bias_acts = f_acts.clone()
+                                            bias_acts[:, ~high_freq_mask] = 0.0
+                                            bias_recon = bias_acts @ W_dec
+                                            x_f = acts.reshape(-1, acts.shape[-1]).float() if acts.dim() > 1 else acts.float()
+                                            var_x = x_f.var() + 1e-8
+                                            bev_raw = 1.0 - (x_f - bias_recon.float()).var() / var_x
+                                            _last_bev = float(bev_raw.clamp(min=0.0).item())
+                                        else:
+                                            _last_bev = 0.0
+                                    except Exception:
+                                        pass
+
                         # GPU 메모리 즉시 해제 (연산 그래프 참조 제거)
                         del acts, out, loss
 
                     if tokens_accum == 0:
                         break
 
-                    clip_grad = float(cfg_l.get("clip_grad", tr_cfg.get("clip_grad", 1.0)))
+                    e2e_name = str(cfg_lv.get("e2e_loss_name", tr_cfg.get("e2e_loss_name", ""))).strip().lower()
+                    e2e_start = int(cfg_lv.get("e2e_start_step", tr_cfg.get("e2e_start_step", 0)))
+                    e2e_every = max(1, int(cfg_lv.get("e2e_every_steps", tr_cfg.get("e2e_every_steps", 1))))
+                    if e2e_name in {"kl_mse", "mse_kl", "kl+mse", "kl_mse_e2e"}:
+                        current_zero_based_step = steps_done[lv]
+                        if current_zero_based_step >= e2e_start and ((current_zero_based_step - e2e_start) % e2e_every == 0):
+                            raw_batch = self.activation_store._get_batch_data() if self.activation_store is not None else None
+                            e2e_loss, e2e_stats = self._compute_e2e_kl_mse_loss(lv, raw_batch, cfg_lv)
+                            if e2e_loss is not None:
+                                e2e_loss.backward()
+
+                    clip_grad = float(cfg_lv.get("clip_grad", tr_cfg.get("clip_grad", 1.0)))
                     if clip_grad > 0:
                         torch.nn.utils.clip_grad_norm_(sae.parameters(), clip_grad)
 
                     opt.step()
-                    sched_for[lname].step()
+                    sched_for[lv].step()
                     if hasattr(sae, "make_decoder_weights_and_grad_unit_norm"):
                         sae.make_decoder_weights_and_grad_unit_norm()
 
                     # === Bias feature folding ===
-                    fold_every = int(cfg_l.get("fold_every_steps", tr_cfg.get("fold_every_steps", 0)))
-                    if fold_every > 0 and hasattr(sae, "fold_bias_features") and steps_done[lname] % fold_every == 0:
-                        fold_freq_thr = float(cfg_l.get("fold_freq_threshold", tr_cfg.get("fold_freq_threshold", 0.95)))
-                        fold_cv_thr = float(cfg_l.get("fold_cv_threshold", tr_cfg.get("fold_cv_threshold", 0.02)))
+                    fold_every = int(cfg_lv.get("fold_every_steps", tr_cfg.get("fold_every_steps", 0)))
+                    if fold_every > 0 and hasattr(sae, "fold_bias_features") and steps_done[lv] % fold_every == 0:
+                        fold_freq_thr = float(cfg_lv.get("fold_freq_threshold", tr_cfg.get("fold_freq_threshold", 0.95)))
+                        fold_cv_thr = float(cfg_lv.get("fold_cv_threshold", tr_cfg.get("fold_cv_threshold", 0.02)))
                         n_folded = sae.fold_bias_features(freq_threshold=fold_freq_thr, cv_threshold=fold_cv_thr)
                         if n_folded > 0:
-                            logger.info(f"[fold] {lname} step={steps_done[lname]+1}: folded {n_folded} bias features into b_norm")
+                            logger.info(f"[fold] {lv} step={steps_done[lv]+1}: folded {n_folded} bias features into b_norm")
                             if self.wandb_run:
-                                safe_f = lname.replace("/", "_")
+                                safe_f = self._safe_key(lv)
                                 self._wandb_log({f"{safe_f}/fold/n_folded": n_folded})
 
-                    steps_done[lname] += 1
+                    steps_done[lv] += 1
                     steps_this_cycle += 1
-                    self.tokens_seen[lname] += tokens_accum
+                    self.tokens_seen[lv] += tokens_accum
                     any_trained_local = True
 
                     # 공통 집계 값
@@ -1677,12 +2256,25 @@ class SAETrainingPipeline:
                     mean_aux  = sum_aux  / denom
                     mean_freq = sum_freq / denom
 
+                    # [DEBUG-variants] gradient norm logging
+                    with torch.no_grad():
+                        grad_norm = 0.0
+                        try:
+                            grad_norm = float(sum(
+                                p.grad.detach().norm().item() ** 2
+                                for p in sae.parameters() if p.grad is not None
+                            ) ** 0.5)
+                        except Exception:
+                            pass
+                    logger.debug("[grad] %s step=%d loss=%.5f grad_norm=%.4f",
+                                 lv, steps_done[lv], mean_loss, grad_norm)
+
                     # === 속도 로그(원하면 tqdm 대체) ===
                     if speed_log_sec > 0:
-                        st = speed_track.get(lname)
+                        st = speed_track.get(lv)
                         if st is None:
                             st = {"tokens": 0, "elapsed": 0.0, "steps": 0}
-                            speed_track[lname] = st
+                            speed_track[lv] = st
                         st["tokens"] += tokens_accum
                         st["steps"]  += 1
                         st["elapsed"] += (time.time() - step_t0)
@@ -1690,7 +2282,7 @@ class SAETrainingPipeline:
                             qtok = int(getattr(q, "ntoks", 0)) if q is not None else 0
                             tps = st["tokens"] / max(st["elapsed"], 1e-6)
                             print(
-                                f"[speed] {lname} rank={self.rank} step={steps_done[lname]} "
+                                f"[speed] {lv} rank={self.rank} step={steps_done[lv]} "
                                 f"tokens/s={tps:,.0f} queue={qtok} loss={mean_loss:.5f}",
                                 flush=True,
                             )
@@ -1699,8 +2291,8 @@ class SAETrainingPipeline:
                             st["elapsed"] = 0.0
 
                     # === wandb 로깅 ===
-                    if self.wandb_run and (steps_done[lname] % max(1, log_every) == 0):
-                        safe = lname.replace("/", "_")
+                    if self.wandb_run and (steps_done[lv] % max(1, log_every) == 0):
+                        safe = self._safe_key(lv)
                         sparsity  = (nz_total / max(1, elts_total))
                         k_eff     = (k_eff_sum / denom)
                         pos_mean  = (pos_sum / max(1, pos_count))
@@ -1712,8 +2304,8 @@ class SAETrainingPipeline:
                             dead_frac = 0.0
 
                         payload = {
-                            f"{safe}/step": steps_done[lname],
-                            f"{safe}/token_seen": self.tokens_seen[lname],
+                            f"{safe}/step": steps_done[lv],
+                            f"{safe}/token_seen": self.tokens_seen[lv],
 
                             # step 축(접두 네임스페이스)
                             f"{safe}/by_step/loss":       mean_loss,
@@ -1778,6 +2370,8 @@ class SAETrainingPipeline:
                             payload[f"{safe}/by_token/bias_explained_var"] = _last_bev
                         if _last_nhf is not None:
                             payload[f"{safe}/freq/n_high_freq"] = _last_nhf
+                        for metric_name, metric_val in e2e_stats.items():
+                            payload[f"{safe}/{metric_name}"] = metric_val
 
                         # --- Feature frequency monitoring ---
                         if hasattr(sae, "feature_freq_ema"):
@@ -1799,7 +2393,7 @@ class SAETrainingPipeline:
 
                     # === console 로깅 (wandb 없어도) ===
                     _console_every = 100
-                    if steps_done[lname] % _console_every == 0:
+                    if steps_done[lv] % _console_every == 0:
                         _sparsity = (nz_total / max(1, elts_total))
                         _k_eff_v = (k_eff_sum / denom) if denom > 0 else 0
                         try:
@@ -1811,17 +2405,37 @@ class SAETrainingPipeline:
                         _svar = (sum_svar / denom) if denom > 0 else 0
                         _bev_s = f" bev={_last_bev:.4f}" if _last_bev is not None else ""
                         _nhf_s = f" nhf={_last_nhf}" if _last_nhf is not None else ""
+                        _e2e_s = ""
+                        if e2e_stats:
+                            _e2e_total = e2e_stats.get("e2e/total")
+                            _e2e_kl = e2e_stats.get("e2e/logits_kl")
+                            if _e2e_total is not None and _e2e_kl is not None:
+                                _e2e_s = f" e2e={_e2e_total:.4f} e2e_kl={_e2e_kl:.4f}"
+                        _freq_s = ""
+                        if hasattr(sae, "feature_freq_ema"):
+                            _freq = sae.feature_freq_ema.float()
+                            _hfrac = (_freq > 0.1).float().mean().item()
+                            _lfrac = ((_freq > 0) & (_freq < 0.01)).float().mean().item()
+                            _alive = _freq > 0
+                            if _alive.sum() > 1:
+                                _sf = _freq[_alive].sort().values
+                                _n = _sf.shape[0]
+                                _idx = torch.arange(1, _n + 1, dtype=torch.float32, device=_sf.device)
+                                _gini = max(0.0, (2.0 * (_idx * _sf).sum() / (_n * _sf.sum()) - (_n + 1.0) / _n).item())
+                            else:
+                                _gini = 0.0
+                            _freq_s = f" high_frac={_hfrac:.4f} low_frac={_lfrac:.4f} gini={_gini:.3f}"
                         print(
-                            f"[online] {lname} step={steps_done[lname]} "
+                            f"[online] {lv} step={steps_done[lv]} "
                             f"loss={mean_loss:.4f} l2={mean_l2:.4f} aux={mean_aux:.4f} "
                             f"svar={_svar:.4f}{_bev_s}{_nhf_s} "
                             f"rel_l2={_rl2:.4f} sparsity={_sparsity:.6f} k_eff={_k_eff_v:.1f} "
-                            f"dead_frac={_df:.4f}",
+                            f"dead_frac={_df:.4f}{_e2e_s}{_freq_s}",
                             flush=True,
                         )
 
                     # === 히스토그램/노름 등 주기적 로깅 ===
-                    if self.wandb_run and hist_every > 0 and steps_done[lname] % hist_every == 0:
+                    if self.wandb_run and hist_every > 0 and steps_done[lv] % hist_every == 0:
                         try:
                             # 최근 마이크로배치의 활성 히스토그램 (샘플)
                             if 'fa' in locals() and fa is not None:
@@ -1839,7 +2453,7 @@ class SAETrainingPipeline:
                             pass
 
 
-                    if self.wandb_run and hist_every > 0 and steps_done[lname] % hist_every == 0:
+                    if self.wandb_run and hist_every > 0 and steps_done[lv] % hist_every == 0:
                         try:
                             self._wandb_log({
                                 f"{safe}/W_enc_norm": float(sae.W_enc.detach().norm().item()),
@@ -1851,15 +2465,15 @@ class SAETrainingPipeline:
 
                     # periodic memory log
                     mem_every = int(tr_cfg.get("mem_log_every_steps", 0))
-                    if mem_every > 0 and (steps_done[lname] % mem_every == 0):
-                        self._log_gpu_memory(f"train_step_{steps_done[lname]}")
+                    if mem_every > 0 and (steps_done[lv] % mem_every == 0):
+                        self._log_gpu_memory(f"train_step_{steps_done[lv]}")
 
                     # === ckpt 저장 ===
-                    if ckpt_every > 0 and (steps_done[lname] % ckpt_every == 0):
-                        self._save_layer_ckpt(lname, steps_done[lname], opt, self.tokens_seen[lname])
-                        
+                    if ckpt_every > 0 and (steps_done[lv] % ckpt_every == 0):
+                        self._save_layer_ckpt(lv, steps_done[lv], opt, self.tokens_seen[lv])
+
             # 종료 조건: 모든 레이어 목표 달성(전 랭크 합) — collect 전에 체크
-            local_remaining = sum(1 for ln in self.my_layers_to_train if steps_done[ln] < steps_goal)
+            local_remaining = sum(1 for lv in self.my_lv_keys if steps_done.get(lv, 0) < steps_goal)
             if dist.is_initialized():
                 rem = torch.tensor([local_remaining], device=self.device, dtype=torch.long)
                 dist.all_reduce(rem, op=dist.ReduceOp.SUM)
@@ -1912,8 +2526,9 @@ def setup(rank, world_size):
         torch.cuda.set_device(local_rank)
 
     from datetime import timedelta
+    backend = os.environ.get("DIST_BACKEND", "nccl")
     dist.init_process_group(
-        "nccl", rank=rank, world_size=world_size,
+        backend, rank=rank, world_size=world_size,
         timeout=timedelta(hours=2),
     )
     return local_rank

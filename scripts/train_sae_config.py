@@ -5,7 +5,15 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from argparse import Namespace
+from pathlib import Path
+
+# Ensure THIS project's src/ is first on sys.path, overriding any editable installs
+# from other projects (e.g. General_SAE_project) that may shadow our src package.
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 from src.core.sae.train.runner import SAETrainingPipeline, main_worker
 

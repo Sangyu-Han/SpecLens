@@ -11,14 +11,15 @@ pack:
 
 dataset:
   builder: src.packs.sam2.train.factories:build_dataset
-  img_folder: /mnt/sav_frames/JPEGImages_sav
-  gt_folder: /mnt/SA-V-json-flat
+  img_folder: /media/sangyu/T7/sa-v_dataset/sav_frames/JPEGImages_sav
+  gt_folder: /media/sangyu/T7/sa-v_dataset/SA-V-json-flat
+  file_list_txt: configs/sav_valid_videos.txt
   batch_size: 8  # [중요] GPU 1개당 SAM2Train 모델의 배치 크기. (글로벌 배치 = batch_size * GPU 개수)
   num_frames: 4
   resize: 1024
   max_num_objects: 3
   prompt_policy:
-    dataset_prompt_ratio: 0.05
+    dataset_prompt_ratio: 0.5
     dataset_method: center
     random_method: uniform
     init_cond_frames: [0]
@@ -76,6 +77,7 @@ sae:
     # === 스케줄 ===
     num_training_steps: 50000000
     ckpt_every_steps: 50000
+    keep_last_ckpts: 3
 
     # === sync & 메모리 전송 ===
     sync:

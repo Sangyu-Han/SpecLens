@@ -1,0 +1,179 @@
+pack:
+  sys_paths:
+    - third_party/sam2_src
+  setup: src.packs.sam2.train.factories:setup_env
+
+
+# ---------------------------------------------------------------------- #
+# DATASET & MODEL
+# ---------------------------------------------------------------------- #
+dataset:
+  builder: src.packs.sam2.train.factories:build_dataset
+  img_folder: /media/sangyu/T7/sa-v_dataset/sav_frames/JPEGImages_sav
+  gt_folder: /media/sangyu/T7/sa-v_dataset/SA-V-json-flat
+  batch_size: 4  # 8은 1024x1024 x 4frames OOM → 4로 제한
+  num_frames: 4
+  resize: 1024
+  max_num_objects: 3
+  prompt_policy:
+    dataset_prompt_ratio: 0.5
+    dataset_method: center
+    random_method: uniform
+    init_cond_frames: [0]
+    seed: 12345
+
+model:
+  loader: src.packs.sam2.train.factories:load_model
+  name: sam2_hiera_t
+  device: cuda
+  yaml: configs/models/sam2.1_training/sam2.1_hiera_t.yaml
+  ckpt: checkpoints/models/sam2.1/sam2.1_hiera_tiny.pt
+
+# ---------------------------------------------------------------------- #
+# LOGGING
+# ---------------------------------------------------------------------- #
+logging:
+  level: INFO
+  log_file: outputs/logs/sam2_sav_batchtopk.log
+  wandb:
+    enabled: true
+    mode: online
+    project: sam2-sae
+    entity: acoexist96
+    run_name: sam2_sav_batchtopk_ef32_k64
+    group: sam2_sav_batchtopk_ef32_k64
+    tags: [sam2, sae, batch-topk, tiny, ef32, k64]
+  log_every_steps: 10
+  log_hist_every_steps: 1000
+  upload_checkpoints: false
+
+# ---------------------------------------------------------------------- #
+# SAE
+# ---------------------------------------------------------------------- #
+sae:
+  store:
+    factory: src.packs.sam2.train.factories:create_store
+  layers:
+    - model.obj_ptr_proj
+    - model.memory_attention.layers.0
+    - model.image_encoder.trunk@3
+    - model.memory_attention.layers.3
+    - model.memory_encoder@vision_features
+    - model.memory_encoder@vision_pos_enc@0
+    - model.sam_mask_decoder.transformer.layers.1@0
+    - model.sam_mask_decoder.transformer.layers.1@1
+
+  output:
+    save_path: outputs/sam2_sav_batchtopk_ef32_k64
+
+  debug:
+    sync_before_hook_copy: false
+
+  training:
+    # === 스케줄 ===
+    num_training_steps: 200000
+    ckpt_every_steps: 2500
+    keep_last_ckpts: 3
+
+    # === sync & 메모리 전송 ===
+    sync:
+      mode: owner_stream
+      transfer_dtype: float32
+      dynamic_chunking: true
+      chunk_mb: 16
+      min_chunk_tokens: 8192
+      max_chunk_tokens: 262144
+      target_free_frac: 0.6
+      safety_mb: 256
+      max_chunk_mb: 64
+      min_chunk_mb: 4
+
+    collect_policy: all
+
+    # === 수집 라운드 자동 튜닝 ===
+    adaptive_collect: true
+    max_collect_batches_per_round: 4
+    min_collect_batches_per_round: 1
+
+    # === 블록 큐 (ViT 와 동일) ===
+    queue:
+      hook_copy_chunk_tokens: 8192
+      block_size_tokens: 16384
+      in_memory_blocks_per_layer: 16
+      spill_to_disk: false
+      mix_buffer_batches: 8
+      mix_fraction: 0.5
+      diversity:
+        enabled: true
+        k: 64
+        resample_every: 5
+
+    # === SAE 타입 & 공통 하이퍼 ===
+    # ViT-B/16 학습과 동일한 설정 (expansion_factor=32, k=64)
+    # image_encoder.trunk@3 은 ViT-B 와 동일한 768-dim
+    sae_type: batch-topk
+    expansion_factor: 32        # ViT-B 와 동일: dim * 32
+    k: 64                       # ViT-B 와 동일: SAELens 권장 50-100 range
+    k_aux: 512                  # ViT-B 와 동일: dead feature recovery
+    aux_frac: 0.03125           # 1/32, SAELens default
+    lr: 2.0e-4                  # ViT-B 와 동일
+    lr_final: 2.0e-5            # 10% of base
+    warmup_steps: 1000
+    l1_coeff: 0.0
+    input_unit_norm: true
+    n_batches_to_dead: 20
+    dtype: float32
+    seed: 42
+    stride: 1  # diversity sampling에 위임, stride 서브샘플링 제거
+
+    # === 버퍼 (ViT 와 동일) ===
+    activation_batch_size: 4096
+    n_batches_in_buffer: 2
+    low_watermark_tokens: 4096
+    high_watermark_tokens: 65536
+    batches_per_collect_round: 2
+
+    # === 레이어별 오버라이드 ===
+    # trunk@3: 768-dim, ViT-B 와 동일 → 오버라이드 불필요
+    # 256-dim 레이어: expansion_factor=32 → 8,192 features
+    # 64-dim 레이어 (vision_pos_enc): expansion_factor=32 → 2,048 features
+
+    per_layer:
+      "model.memory_encoder@vision_features":
+        batch_size: 8192
+        high: 2_000_000
+
+      "model.memory_encoder@vision_pos_enc@0":
+        batch_size: 8192
+        high: 2_000_000
+
+      "model.image_encoder.trunk@3":
+        batch_size: 4096
+        high: 2_000_000
+
+      "model.memory_attention.layers.0":
+        batch_size: 8192
+        high: 2_000_000
+        k: 32
+
+      "model.memory_attention.layers.3":
+        batch_size: 8192
+        high: 2_000_000
+        k: 32
+
+      "model.obj_ptr_proj":
+        batch_size: 32
+        low: 1
+        high: 100_000
+        k: 16
+        k_aux: 64
+
+      "model.sam_mask_decoder.transformer.layers.1@0":
+        batch_size: 128
+        high: 100_000
+        k: 16
+
+      "model.sam_mask_decoder.transformer.layers.1@1":
+        batch_size: 8192
+        high: 2_000_000
+        k: 32
