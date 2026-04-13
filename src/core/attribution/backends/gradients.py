@@ -758,6 +758,265 @@ def build_vargrad_backend(
     )
 
 
+# -------- AnnealedConcrete (optimization-based ERF) -------------
+@register("annealed_concrete")
+def build_annealed_concrete_backend(
+    *,
+    objective_getter: Callable[[], ObjectiveLike],
+    do_forward_masked: Callable[[torch.Tensor], None],
+    distribution_getter: Optional[Callable[[], torch.Tensor]] = None,
+    acts_orig_spatial: Optional[torch.Tensor] = None,
+    loss_mode: str = "recovery",
+    pearson_weight: float = 0.5,
+    irrelevance: Optional[torch.Tensor] = None,
+    irrelevance_weight: float = 1.0,
+    tv_weight: float = 0.0,
+    n_patches: int = 196,
+    lam: float = 0.02,
+    steps: int = 25,
+    lr: float = 0.15,
+    lr_end: Optional[float] = None,
+    tau_start: float = 3.0,
+    tau_end: float = 0.05,
+    init_prob: float = 0.9,
+    init_log_alphas: Optional[torch.Tensor] = None,
+    optimizer_name: Optional[str] = None,
+    adam_beta1: float = 0.9,
+    adam_beta2: float = 0.999,
+    adam_eps: float = 1e-8,
+    cautious_rescale: bool = True,
+    hc_beta: float = 2.0 / 3.0,
+    hc_gamma: float = -0.1,
+    hc_zeta: float = 1.1,
+    seed: int = 0,
+    device: Optional[Union[str, torch.device]] = None,
+    **_: Any,
+) -> Callable[[], Dict[str, torch.Tensor]]:
+    """
+    Optimization-based ERF via Hard-Concrete mask relaxation.
+
+    loss_mode:
+      "recovery"  : (1 - act/act_orig) + lam*L0
+      "pearson"   : (1 - pearson(acts_spatial, acts_orig_spatial)) + lam*L0
+                    Requires distribution_getter + acts_orig_spatial.
+      "combined"  : recovery + pearson_weight * pearson_spatial + lam*L0
+                    Requires distribution_getter + acts_orig_spatial.
+
+    optimizer_name:
+      None                   : default to cautious Adam + cosine for soft insertion/deletion,
+                               plain Adam for the legacy HC losses.
+      "adam"                 : torch.optim.Adam with fixed lr.
+      "cautious_adam"        : Adam moments + cautious sign mask, fixed lr.
+      "cautious_adam_cosine" : cautious Adam with cosine lr decay from lr to lr_end.
+
+    distribution_getter(): called after do_forward_masked; returns [n_patches]
+        SAE activations for the target feature (in grad graph).
+    acts_orig_spatial: [n_patches] precomputed original spatial activations (no grad).
+    """
+    import math
+
+    def _logit(p: float) -> float:
+        p = min(max(p, 1e-4), 1 - 1e-4)
+        return math.log(p / (1 - p))
+
+    def _hc_l0(log_alpha: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(log_alpha - hc_beta * math.log(-hc_gamma / hc_zeta))
+
+    def _pearson_loss(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """1 - pearson(x, y).  Differentiable w.r.t. x; y is treated as fixed."""
+        xm = x - x.mean()
+        ym = y - y.mean()
+        cos = (xm * ym).sum() / (xm.norm() * ym.norm() + 1e-8)
+        return 1.0 - cos
+
+    def run() -> Dict[str, torch.Tensor]:
+        dev = device
+        if dev is None:
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        dev = torch.device(dev)
+
+        torch.manual_seed(seed)
+
+        # Reference forward (z=1 everywhere, no mask)
+        with torch.no_grad():
+            ones = torch.ones(n_patches, device=dev)
+            do_forward_masked(ones)
+            act_orig_val = _prepare_objective(objective_getter()).scalar_value.detach()
+            acts_orig = (
+                acts_orig_spatial.to(dev).detach()
+                if acts_orig_spatial is not None
+                else None
+            )
+
+        if init_log_alphas is not None:
+            log_alphas = init_log_alphas.detach().to(dev).clone().requires_grad_(True)
+        else:
+            log_alphas = torch.full(
+                (n_patches,), _logit(init_prob),
+                device=dev, requires_grad=True,
+            )
+
+        resolved_optimizer = optimizer_name
+        if resolved_optimizer is None:
+            if loss_mode in {"soft_ins_auc", "soft_del_auc"}:
+                resolved_optimizer = "cautious_adam_cosine"
+            else:
+                resolved_optimizer = "adam"
+        valid_optimizers = {"adam", "cautious_adam", "cautious_adam_cosine"}
+        if resolved_optimizer not in valid_optimizers:
+            raise ValueError(
+                f"Unknown optimizer_name={resolved_optimizer!r}; "
+                f"expected one of {sorted(valid_optimizers)}"
+            )
+
+        final_lr = lr_end
+        if final_lr is None:
+            final_lr = 0.01 if resolved_optimizer == "cautious_adam_cosine" else lr
+
+        opt = None
+        m = None
+        v = None
+        if resolved_optimizer == "adam":
+            opt = torch.optim.Adam(
+                [log_alphas],
+                lr=lr,
+                betas=(adam_beta1, adam_beta2),
+                eps=adam_eps,
+            )
+        else:
+            m = torch.zeros_like(log_alphas)
+            v = torch.zeros_like(log_alphas)
+
+        irr = irrelevance.to(dev).detach() if irrelevance is not None else None
+
+        grid_h = grid_w = int(n_patches ** 0.5)  # 14 for 196 patches
+
+        def _tv_loss(z: torch.Tensor) -> torch.Tensor:
+            g = z.view(grid_h, grid_w)
+            return (g[:, :-1] - g[:, 1:]).abs().sum() + (g[:-1, :] - g[1:, :]).abs().sum()
+
+        eps = 1e-6
+        for step in range(steps):
+            if opt is not None:
+                opt.zero_grad(set_to_none=True)
+            elif log_alphas.grad is not None:
+                log_alphas.grad.zero_()
+
+            frac = step / max(steps - 1, 1)
+            tau = tau_start * (tau_end / tau_start) ** frac
+
+            if loss_mode == "soft_ins_auc":
+                # Direct soft-insertion AUC optimization.
+                # At each step, sample a budget b ~ Uniform(0, N) and compute the
+                # soft-insertion weights w_i = clamp(p_i * b, 1) where p_i is the
+                # normalized probability mass derived from log_alphas.
+                # Loss = 1 - act(w) / act_orig  (no L0: budget sampling self-regularizes)
+                # This is differentiable w.r.t. log_alphas through p → w → h_inj → act.
+                # No HC sampling needed here — skip the z computation entirely.
+                probs = torch.sigmoid(log_alphas)              # [n_patches]
+                p = probs / (probs.sum() + 1e-8)               # normalized, sums to 1
+                b_sample = torch.rand(1, device=dev).item() * n_patches
+                w = (p * b_sample).clamp(max=1.0)              # soft-ins weights
+                irr_penalty = (
+                    irrelevance_weight * (torch.sigmoid(log_alphas) * irr).sum()
+                    if irr is not None else 0.0
+                )
+                tv_penalty = tv_weight * _tv_loss(probs) if tv_weight > 0.0 else 0.0
+                do_forward_masked(w)
+                act_masked = _prepare_objective(objective_getter()).scalar_value
+                loss = (1.0 - act_masked / act_orig_val.clamp(min=1e-8)) + irr_penalty + tv_penalty
+
+            elif loss_mode == "soft_del_auc":
+                # Deletion-direction soft AUC optimization.
+                # probs = sigmoid(log_alphas) = "importance / keep-probability" of each patch.
+                # Deletion mass: q_i = (1 - probs_i) / sum(1 - probs) — normalized removal weights.
+                # At each step, sample budget b_del ~ Uniform(0, N) and compute:
+                #   del_w_i = clamp(q_i * b_del, 1)  = how much each patch is removed
+                #   keep_w_i = 1 - del_w_i           = effective keep weight
+                # Loss = 1 - act(keep_w) / act_orig  (maintain activation despite deletion)
+                # Gradient: for a critical patch i, removing it hurts → ∂loss/∂probs_i > 0
+                #   → optimizer increases probs_i → q_i decreases → patch is protected.
+                # For irrelevant patches: removing them doesn't hurt → probs_i stays low.
+                # This yields a calibrated sparse distribution where important patches have
+                # high probs (matching their true marginal contribution from the full-set view).
+                probs = torch.sigmoid(log_alphas)              # [n_patches]
+                q = (1.0 - probs) / ((1.0 - probs).sum() + 1e-8)  # deletion mass
+                b_del = torch.rand(1, device=dev).item() * n_patches
+                del_w = (q * b_del).clamp(max=1.0)            # how much each patch is deleted
+                keep_w = 1.0 - del_w                           # effective keep weight
+                irr_penalty = (
+                    irrelevance_weight * (probs * irr).sum()
+                    if irr is not None else 0.0
+                )
+                tv_penalty = tv_weight * _tv_loss(probs) if tv_weight > 0.0 else 0.0
+                do_forward_masked(keep_w)
+                act_masked = _prepare_objective(objective_getter()).scalar_value
+                loss = (1.0 - act_masked / act_orig_val.clamp(min=1e-8)) + irr_penalty + tv_penalty
+
+            else:
+                u = torch.rand_like(log_alphas).clamp(eps, 1 - eps)
+                z = torch.sigmoid((log_alphas + torch.log(u) - torch.log(1 - u)) / tau)
+
+                do_forward_masked(z)
+                l0 = _hc_l0(log_alphas).sum()
+
+                irr_penalty = (
+                    irrelevance_weight * (torch.sigmoid(log_alphas) * irr).sum()
+                    if irr is not None else 0.0
+                )
+
+                tv_penalty = tv_weight * _tv_loss(z) if tv_weight > 0.0 else 0.0
+
+                if loss_mode == "recovery":
+                    act_masked = _prepare_objective(objective_getter()).scalar_value
+                    loss = (1.0 - act_masked / act_orig_val.clamp(min=1e-8)) + lam * l0 + irr_penalty + tv_penalty
+
+                elif loss_mode == "pearson":
+                    assert distribution_getter is not None and acts_orig is not None
+                    dist_masked = distribution_getter()  # [n_patches], in grad graph
+                    loss = _pearson_loss(dist_masked, acts_orig) + lam * l0 + irr_penalty + tv_penalty
+
+                elif loss_mode == "combined":
+                    assert distribution_getter is not None and acts_orig is not None
+                    act_masked = _prepare_objective(objective_getter()).scalar_value
+                    dist_masked = distribution_getter()
+                    recovery = 1.0 - act_masked / act_orig_val.clamp(min=1e-8)
+                    pearson  = _pearson_loss(dist_masked, acts_orig)
+                    loss = recovery + pearson_weight * pearson + lam * l0 + irr_penalty + tv_penalty
+
+                else:
+                    raise ValueError(f"Unknown loss_mode: {loss_mode!r}")
+
+            loss.backward()
+
+            if opt is not None:
+                opt.step()
+            else:
+                assert m is not None and v is not None
+                cur_lr = lr
+                if resolved_optimizer == "cautious_adam_cosine":
+                    cur_lr = final_lr + 0.5 * (lr - final_lr) * (1 + math.cos(math.pi * frac))
+
+                with torch.no_grad():
+                    g = log_alphas.grad.detach()
+                    t = step + 1
+                    m.mul_(adam_beta1).add_(g, alpha=1.0 - adam_beta1)
+                    v.mul_(adam_beta2).addcmul_(g, g, value=1.0 - adam_beta2)
+                    m_hat = m / (1.0 - adam_beta1 ** t)
+                    v_hat = v / (1.0 - adam_beta2 ** t)
+                    adam_dir = m_hat / (v_hat.sqrt() + adam_eps)
+                    mask = (adam_dir * g > 0).to(dtype=log_alphas.dtype)
+                    if cautious_rescale:
+                        n_active = mask.sum().clamp(min=1.0)
+                        mask = mask * (float(n_patches) / n_active)
+                    log_alphas.add_(adam_dir * mask, alpha=-cur_lr)
+                    log_alphas.grad = None
+
+        return {"log_alphas": log_alphas.detach().cpu()}
+
+    return run
+
+
 # -------- GradientSHAP (noisy input x grad) -------------
 @register("gradient_shap")
 def build_gradient_shap_backend(

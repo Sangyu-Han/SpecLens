@@ -12,6 +12,9 @@ build/
 venv/
 env/
 
+# claude
+.claude/
+
 # IDE
 .vscode/
 .idea/
@@ -32,5 +35,12 @@ checkpoints/
 # Jupyter
 .ipynb_checkpoints/
 
+# third_party
+third_party/
+atlas-vit-refer-code/
 # OS
 .DS_Store
+
+
+#research
+*research*/

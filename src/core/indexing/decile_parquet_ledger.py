@@ -1,7 +1,8 @@
 # src/sae_index/decile_parquet_ledger.py
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Mapping, Sequence
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.dataset as ds
@@ -54,28 +55,110 @@ class DecileParquetLedger:
             .append(pa.field("part", pa.int32()))
         )
 
-    def write_rows(self, rows: List[Dict[str, Any]], *, rank: int = 0) -> int:
+    def _table_from_row_dicts(self, rows: List[Dict[str, Any]]) -> pa.Table:
+        sch = self._schema_with_partitions()
+        n_rows = len(rows)
+        cols: Dict[str, List[Any]] = {f.name: [None] * n_rows for f in sch}
+
+        # Timing: populate all parquet columns in one row pass so finalize() does not
+        # pay an additional schema x rows walk with millions of dict.get calls.
+        for idx, row in enumerate(rows):
+            layer = str(row["layer"])
+            decile = int(row["decile"])
+            sample_id = int(row["sample_id"])
+
+            cols["run_id"][idx] = row["run_id"]
+            cols["layer"][idx] = layer
+            cols["unit"][idx] = int(row["unit"])
+            cols["score"][idx] = float(row["score"])
+            cols["decile"][idx] = decile
+            cols["rank_in_decile"][idx] = int(row["rank_in_decile"])
+            cols["sample_id"][idx] = sample_id
+            cols["frame_idx"][idx] = int(row["frame_idx"])
+            cols["y"][idx] = int(row["y"])
+            cols["x"][idx] = int(row["x"])
+            cols["prompt_id"][idx] = int(row["prompt_id"])
+            cols["uid"][idx] = int(row.get("uid", -1))
+            cols["stride_step"][idx] = int(row["stride_step"])
+            cols["meta_json"][idx] = row.get("meta_json", "")
+            cols["layer_part"][idx] = layer
+            cols["decile_part"][idx] = decile
+            cols["part"][idx] = _part(sample_id, self.M)
+
+        arrays = {
+            f.name: pa.array(cols[f.name], type=f.type)
+            for f in sch
+        }
+        return pa.table(arrays, schema=sch)
+
+    def _table_from_columnar(self, columns: Mapping[str, Sequence[Any]]) -> pa.Table:
+        sch = self._schema_with_partitions()
+        names = list(columns.keys())
+        if not names:
+            return pa.table({f.name: pa.array([], type=f.type) for f in sch}, schema=sch)
+
+        n_rows = len(columns[names[0]])
+        for name in names[1:]:
+            if len(columns[name]) != n_rows:
+                raise ValueError(
+                    f"Column '{name}' has length {len(columns[name])}, expected {n_rows}"
+                )
+
+        def _require(name: str) -> Sequence[Any]:
+            if name not in columns:
+                raise KeyError(f"Missing required parquet column '{name}'")
+            return columns[name]
+
+        sample_ids = np.asarray(_require("sample_id"), dtype=np.int64)
+        layers = [str(v) for v in _require("layer")]
+        deciles = np.asarray(_require("decile"), dtype=np.int32)
+
+        if n_rows:
+            parts = np.remainder(sample_ids, self.M).astype(np.int32, copy=False)
+        else:
+            parts = np.empty((0,), dtype=np.int32)
+
+        payload: Dict[str, Sequence[Any]] = {
+            "run_id": _require("run_id"),
+            "layer": layers,
+            "unit": _require("unit"),
+            "score": _require("score"),
+            "decile": deciles,
+            "rank_in_decile": _require("rank_in_decile"),
+            "sample_id": sample_ids,
+            "frame_idx": _require("frame_idx"),
+            "y": _require("y"),
+            "x": _require("x"),
+            "prompt_id": _require("prompt_id"),
+            "uid": columns.get("uid", [-1] * n_rows),
+            "stride_step": _require("stride_step"),
+            "meta_json": columns.get("meta_json", [""] * n_rows),
+            "layer_part": layers,
+            "decile_part": deciles,
+            "part": parts,
+        }
+
+        arrays = {
+            f.name: pa.array(payload[f.name], type=f.type)
+            for f in sch
+        }
+        return pa.table(arrays, schema=sch)
+
+    def write_rows(
+        self,
+        rows: List[Dict[str, Any]] | Mapping[str, Sequence[Any]],
+        *,
+        rank: int = 0,
+    ) -> int:
         if not rows:
             return 0
 
-        # (1) 스키마 + 파티션 컬럼 주입
-        sch = self._schema_with_partitions()
-        for r in rows:
-            r["layer_part"]  = str(r["layer"])
-            r["decile_part"] = int(r["decile"])
-            r["part"]        = _part(int(r["sample_id"]), self.M)
-            if "uid" not in r:
-                r["uid"] = -1
-            if "meta_json" not in r:
-                r["meta_json"] = ""
-
-        # (2) Arrow Table 생성
-        cols = {}
-        for f in sch:
-            name = f.name
-            vals = [rr.get(name, None) for rr in rows]
-            cols[name] = pa.array(vals, type=f.type)
-        tbl = pa.table(cols, schema=sch)
+        if isinstance(rows, Mapping):
+            tbl = self._table_from_columnar(rows)
+            n_rows = tbl.num_rows
+        else:
+            tbl = self._table_from_row_dicts(rows)
+            n_rows = len(rows)
 
         # (3) dataset.write_dataset 로 교체 (+ max_partitions 늘리기)
         base = unique_basename("deciles", rank=rank)
@@ -106,7 +189,7 @@ class DecileParquetLedger:
             max_partitions=max_parts,
             use_threads=True,
         )
-        return len(rows)
+        return int(n_rows)
 
 
     # 조회 유틸

@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from math import ceil
@@ -37,7 +38,99 @@ class ResumeMeta:
 def _cp_paths(cp_dir: Path, out_prefix: str, layer_name: Optional[str] = None) -> Path:
     if layer_name is None:
         return cp_dir / f"{out_prefix}.__global__.pt"
-    return cp_dir / f"{out_prefix}.{sanitize_layer_name(layer_name)}.pt"
+    return cp_dir / f"{out_prefix}.{_safe_writer_state_name(layer_name)}.pt"
+
+
+def _lv_key(lname: str, vname: str) -> str:
+    return lname if vname == "default" else f"{lname}@@{vname}"
+
+
+def _lv_parse(key: str) -> tuple[str, str]:
+    if "@@" in key:
+        lname, vname = key.split("@@", 1)
+        return lname, vname
+    return key, "default"
+
+
+def _safe_writer_state_name(key: str) -> str:
+    return sanitize_layer_name(key).replace("@@", "__")
+
+
+def _safe_variant_name(vname: str) -> str:
+    return sanitize_layer_name(vname).replace("@@", "__")
+
+
+def _parse_step_from_path(path: Path) -> int:
+    match = re.search(r"step_(\d+)", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def _configured_variant_names(cfg: Dict[str, Any]) -> list[str]:
+    explicit = cfg.get("indexing", {}).get("variants")
+    if explicit is None:
+        explicit = cfg.get("sae", {}).get("training", {}).get("variants")
+    if not explicit:
+        return []
+
+    names: list[str] = []
+    for entry in explicit:
+        if isinstance(entry, dict):
+            name = str(entry.get("name", "default"))
+        else:
+            name = str(entry)
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _variant_names_for_layer(cfg: Dict[str, Any], sae_root: Path, lname: str) -> list[str]:
+    configured = _configured_variant_names(cfg)
+    if configured:
+        return configured
+
+    layer_dir = sae_root / sanitize_layer_name(lname)
+    if not layer_dir.exists():
+        return ["default"]
+
+    names: list[str] = []
+    if any(layer_dir.glob("*.pt")):
+        names.append("default")
+
+    for child in sorted(layer_dir.iterdir()):
+        if child.is_dir() and any(child.glob("*.pt")) and child.name not in names:
+            names.append(child.name)
+
+    return names or ["default"]
+
+
+def _sae_ckpt_dir_for(sae_root: Path, lname: str, vname: str) -> Path:
+    base = sae_root / sanitize_layer_name(lname)
+    return base if vname == "default" else base / vname
+
+
+def _find_latest_sae_ckpt_path(sae_root: Path, lname: str, vname: str) -> Path | None:
+    ckpt_dir = _sae_ckpt_dir_for(sae_root, lname, vname)
+    if not ckpt_dir.exists():
+        return None
+    candidates = list(ckpt_dir.glob("*.pt"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (_parse_step_from_path(p), p.stat().st_mtime))
+    return candidates[-1]
+
+
+def _variant_out_dir(base_out_dir: Path, vname: str, multi_variant: bool) -> Path:
+    if not multi_variant and vname == "default":
+        return base_out_dir
+    return base_out_dir / "variants" / _safe_variant_name(vname)
+
+
+def _module_device(module: torch.nn.Module) -> torch.device:
+    for param in module.parameters():
+        return param.device
+    for buf in module.buffers():
+        return buf.device
+    return torch.device("cpu")
 
 
 def load_writer_state_if_exists(writer, cp_path: Path) -> None:
@@ -343,49 +436,107 @@ def run_indexing(config_path: str, *, l2_warn_threshold: Optional[float] = None)
         sae_type_fallback = cfg["sae"].get("sae_type", "batch-topk")
         sae_models: Dict[str, torch.nn.Module] = {}
         dict_sizes: Dict[str, int] = {}
-        sae_ckpt_for_layer: Dict[str, str] = {}
+        sae_ckpt_for_writer: Dict[str, str] = {}
+        layer_to_variants: Dict[str, List[str]] = {}
         get_act_size = getattr(store, "get_activation_size", None)
+        create_sae = load_obj(cfg["sae"]["factory"])
+        configured_variants = _configured_variant_names(cfg)
+        offload_inactive_variants = bool(
+            cfg.get("indexing", {}).get(
+                "offload_inactive_variants",
+                cfg.get("sae", {}).get("training", {}).get(
+                    "offload_inactive_variants", False
+                ),
+            )
+        )
 
         logger.info("[index] Loading SAE checkpoints for %d layers …", len(my_layers))
         for ln in my_layers:
-            ldir = sae_root / sanitize_layer_name(ln)
-            ckpts = sorted(ldir.glob("*.pt"))
-            if not ckpts:
-                logger.warning("[index] No SAE checkpoint for %s — skipping", ln)
-                continue
-            path = ckpts[-1]
-            try:
-                pkg = torch.load(path, map_location="cpu")
-            except Exception as e:
-                logger.warning(
-                    "[index] Failed to load checkpoint %s: %s — skipping layer %s",
-                    path, e, ln,
+            loaded_vnames: List[str] = []
+            for vname in _variant_names_for_layer(cfg, sae_root, ln):
+                path = _find_latest_sae_ckpt_path(sae_root, ln, vname)
+                if path is None:
+                    if configured_variants:
+                        logger.warning(
+                            "[index] Missing SAE checkpoint for %s variant=%s under %s",
+                            ln,
+                            vname,
+                            _sae_ckpt_dir_for(sae_root, ln, vname),
+                        )
+                    continue
+                try:
+                    pkg = torch.load(path, map_location="cpu")
+                except Exception as e:
+                    logger.warning(
+                        "[index] Failed to load checkpoint %s: %s — skipping %s variant=%s",
+                        path, e, ln, vname,
+                    )
+                    continue
+                act_size = int(pkg.get("act_size", 0)) or (
+                    get_act_size(ln) if get_act_size else 0
                 )
-                continue
-            act_size = int(pkg.get("act_size", 0)) or (get_act_size(ln) if get_act_size else 0)
-            sae_cfg = pkg.get("sae_config", {}) or {}
-            sae_cfg.update({"act_size": act_size, "device": str(device)})
-            create_sae = load_obj(cfg["sae"]["factory"])
-            sae_type = sae_cfg.get("sae_type") or sae_type_fallback
-            sae = create_sae(sae_type, sae_cfg)
-            try:
-                sae.load_state_dict(pkg.get("sae_state", {}), strict=True)
-            except Exception as e:
-                logger.warning(
-                    "[index] Failed to load SAE state for %s: %s — skipping", ln, e,
-                )
-                continue
-            sae.to(device).eval()
-            sae_models[ln] = sae
-            dict_sizes[ln] = int(
-                sae_cfg.get("dict_size", int(sae_cfg.get("expansion_factor", 8)) * act_size)
-            )
-            sae_ckpt_for_layer[ln] = str(path)
-            logger.info("[index]   ✓ %s (type=%s, act=%d, dict=%d)",
-                        ln, sae_type, act_size, dict_sizes[ln])
+                sae_cfg = pkg.get("sae_config", {}) or {}
+                sae_cfg.update({"act_size": act_size, "device": str(device)})
+                sae_type = sae_cfg.get("sae_type") or sae_type_fallback
+                sae = create_sae(sae_type, sae_cfg)
+                try:
+                    sae.load_state_dict(pkg.get("sae_state", {}), strict=True)
+                except Exception as e:
+                    logger.warning(
+                        "[index] Failed to load SAE state for %s variant=%s: %s",
+                        ln,
+                        vname,
+                        e,
+                    )
+                    continue
+                sae.eval()
+                if offload_inactive_variants:
+                    sae.cpu()
+                else:
+                    sae.to(device)
 
-        logger.info("[index] Loaded %d/%d SAE models. Layers with SAE: %s",
-                    len(sae_models), len(my_layers), list(sae_models.keys()))
+                lv = _lv_key(ln, vname)
+                sae_models[lv] = sae
+                dict_sizes[lv] = int(
+                    sae_cfg.get(
+                        "dict_size",
+                        int(sae_cfg.get("expansion_factor", 8)) * act_size,
+                    )
+                )
+                sae_ckpt_for_writer[lv] = str(path)
+                loaded_vnames.append(vname)
+                logger.info(
+                    "[index]   ✓ %s variant=%s (type=%s, act=%d, dict=%d)",
+                    ln,
+                    vname,
+                    sae_type,
+                    act_size,
+                    dict_sizes[lv],
+                )
+            if loaded_vnames:
+                layer_to_variants[ln] = loaded_vnames
+            else:
+                logger.warning("[index] No SAE checkpoints loaded for %s — skipping", ln)
+
+        loaded_variants = sorted(
+            {vname for vnames in layer_to_variants.values() for vname in vnames}
+        )
+        multi_variant_layout = bool(
+            loaded_variants and (
+                len(loaded_variants) > 1 or any(vname != "default" for vname in loaded_variants)
+            )
+        )
+        logger.info(
+            "[index] Loaded %d SAE models across %d layers. variants=%s",
+            len(sae_models),
+            len(layer_to_variants),
+            loaded_variants or ["default"],
+        )
+        if multi_variant_layout:
+            logger.info(
+                "[index] Multi-variant outputs enabled: parquet roots under %s/variants/<variant>",
+                out_dir,
+            )
 
         model_yaml = str(cfg["model"].get("yaml", ""))
         model_ckpt = str(cfg["model"].get("ckpt") or "")
@@ -418,8 +569,9 @@ def run_indexing(config_path: str, *, l2_warn_threshold: Optional[float] = None)
         cp_acc = 0
 
         cp_every_steps = int(cfg.get("indexing", {}).get("checkpoint_every_steps", 50))
-        dec_ledger = DecileParquetLedger(root_dir=out_dir, M_part=part_mod)
         writers: Dict[str, Any] = {}  # DecileTopKParquet or TopNAggregator
+        variant_output_dirs: Dict[str, Path] = {}
+        variant_ledgers: Dict[str, DecileParquetLedger] = {}
 
         prov_cols = tuple(getattr(store, "prov_cols", ()))
         dedupe_key_fn: Optional[Callable[[tuple], tuple]] = None
@@ -445,64 +597,90 @@ def run_indexing(config_path: str, *, l2_warn_threshold: Optional[float] = None)
         index_mode = cfg["indexing"].get("mode", "decile")
         track_frequency = cfg["indexing"].get("track_frequency", False)
 
-        # Only create writers for layers that have a loaded SAE model
+        def _ledger_for_variant(vname: str) -> DecileParquetLedger:
+            if vname not in variant_ledgers:
+                root = _variant_out_dir(out_dir, vname, multi_variant_layout)
+                ensure_dir(root)
+                variant_output_dirs[vname] = root
+                variant_ledgers[vname] = DecileParquetLedger(root_dir=root, M_part=part_mod)
+            return variant_ledgers[vname]
+
+        # Only create writers for layers/variants that have a loaded SAE model
         for ln in my_layers:
-            if ln not in sae_models:
+            vnames = layer_to_variants.get(ln, [])
+            if not vnames:
                 logger.warning("[index] Skipping writer for %s (no SAE loaded)", ln)
                 continue
-            fp = RunFingerprint(
-                **fp_common,
-                sae_ckpt=sae_ckpt_for_layer.get(ln, ""),
-                sae_ckpt_sha=sha256_of(sae_ckpt_for_layer.get(ln, ""))
-                if sae_ckpt_for_layer.get(ln)
-                else "",
-            )
-            if index_mode == "topn":
-                w = TopNAggregator(
-                    dict_size=dict_sizes[ln],
-                    top_n=int(cfg["indexing"].get("top_n", 300)),
-                    layer_name=ln,
-                    fp=fp,
-                    ledger=dec_ledger,
-                    prov_cols=prov_cols,
-                    track_frequency=track_frequency,
-                    dedupe_key_fn=dedupe_key_fn,
-                    slack=int(cfg["indexing"].get("topk_slack", 4)),
-                    rank=rank,
+            for vname in vnames:
+                lv = _lv_key(ln, vname)
+                fp = RunFingerprint(
+                    **fp_common,
+                    sae_ckpt=sae_ckpt_for_writer.get(lv, ""),
+                    sae_ckpt_sha=sha256_of(sae_ckpt_for_writer.get(lv, ""))
+                    if sae_ckpt_for_writer.get(lv)
+                    else "",
                 )
-            else:
-                maxima0 = torch.zeros(dict_sizes[ln], dtype=torch.float32, device="cpu")
-                w = DecileTopKParquet(
-                    dict_size=dict_sizes[ln],
-                    num_deciles=int(cfg["indexing"]["num_deciles"]),
-                    k=int(cfg["indexing"]["top_k_per_decile"]),
-                    rand_k=int(cfg["indexing"]["random_k_per_feature"]),
-                    maxima=maxima0,
-                    layer_name=ln,
-                    fp=fp,
-                    ledger=dec_ledger,
-                    prov_cols=prov_cols,
-                    dedupe_key_fn=dedupe_key_fn,
-                    boundary=cfg["indexing"].get("boundary", "max_range"),
-                    fixed_cutoffs=cfg["indexing"].get("global_cutoffs"),
-                    slack=int(cfg["indexing"].get("topk_slack", 4)),
-                    rank=rank,
+                ledger = _ledger_for_variant(vname)
+                if index_mode == "topn":
+                    w = TopNAggregator(
+                        dict_size=dict_sizes[lv],
+                        top_n=int(cfg["indexing"].get("top_n", 300)),
+                        layer_name=ln,
+                        fp=fp,
+                        ledger=ledger,
+                        prov_cols=prov_cols,
+                        track_frequency=track_frequency,
+                        dedupe_key_fn=dedupe_key_fn,
+                        slack=int(cfg["indexing"].get("topk_slack", 4)),
+                        rank=rank,
+                    )
+                else:
+                    maxima0 = torch.zeros(dict_sizes[lv], dtype=torch.float32, device="cpu")
+                    w = DecileTopKParquet(
+                        dict_size=dict_sizes[lv],
+                        num_deciles=int(cfg["indexing"]["num_deciles"]),
+                        k=int(cfg["indexing"]["top_k_per_decile"]),
+                        rand_k=int(cfg["indexing"]["random_k_per_feature"]),
+                        maxima=maxima0,
+                        layer_name=ln,
+                        fp=fp,
+                        ledger=ledger,
+                        prov_cols=prov_cols,
+                        dedupe_key_fn=dedupe_key_fn,
+                        boundary=cfg["indexing"].get("boundary", "max_range"),
+                        fixed_cutoffs=cfg["indexing"].get("global_cutoffs"),
+                        slack=int(cfg["indexing"].get("topk_slack", 4)),
+                        rank=rank,
+                    )
+                load_writer_state_if_exists(
+                    w,
+                    _cp_paths(cp_dir, cfg["indexing"]["out_prefix"], lv),
                 )
-            load_writer_state_if_exists(w, _cp_paths(cp_dir, cfg["indexing"]["out_prefix"], ln))
-            writers[ln] = w
+                writers[lv] = w
 
         # Narrow my_layers to only those with SAE + writer
         _all_my_layers = list(my_layers)  # before filtering (for queue drain)
-        my_layers = [ln for ln in my_layers if ln in writers]
-        _drain_layers = [ln for ln in _all_my_layers if ln not in writers]
+        my_layers = [ln for ln in my_layers if layer_to_variants.get(ln)]
+        _drain_layers = [ln for ln in _all_my_layers if not layer_to_variants.get(ln)]
         if _drain_layers:
             logger.warning(
                 "[index] Layers owned by rank %d but without SAE (will drain queues): %s",
                 rank, _drain_layers,
             )
         logger.info("[index] Active layers for rank %d: %s", rank, my_layers)
+        my_writer_keys = [
+            _lv_key(ln, vname)
+            for ln in my_layers
+            for vname in layer_to_variants.get(ln, [])
+            if _lv_key(ln, vname) in writers
+        ]
+        if offload_inactive_variants and my_writer_keys:
+            logger.info(
+                "[index] offload_inactive_variants=True: keeping only one SAE variant on %s at a time",
+                device,
+            )
 
-        resume = read_resume_meta(cp_dir, cfg["indexing"]["out_prefix"], my_layers, device)
+        resume = read_resume_meta(cp_dir, cfg["indexing"]["out_prefix"], my_writer_keys, device)
         fast_forward_if_needed(store, resume, rank)
 
         global_steps_accum = int(resume.steps) if resume.resumed else 0
@@ -522,6 +700,25 @@ def run_indexing(config_path: str, *, l2_warn_threshold: Optional[float] = None)
 
         logger.info("[index] Starting main indexing loop (mode=%s, batches=%d, rank=%d)",
                     cfg["indexing"].get("mode", "decile"), global_batches_total, rank)
+
+        active_sae_lv: Optional[str] = None
+
+        def _activate_variant_sae(lv: str) -> torch.nn.Module:
+            nonlocal active_sae_lv
+            sae = sae_models[lv]
+            if not offload_inactive_variants:
+                return sae
+            if active_sae_lv != lv:
+                if active_sae_lv is not None:
+                    prev = sae_models.get(active_sae_lv)
+                    if prev is not None and _module_device(prev).type != "cpu":
+                        prev.cpu()
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                if _module_device(sae) != device:
+                    sae.to(device)
+                active_sae_lv = lv
+            return sae
 
         while True:
             any_data_local = False
@@ -544,49 +741,54 @@ def run_indexing(config_path: str, *, l2_warn_threshold: Optional[float] = None)
                     continue
 
                 any_data_local = True
-                sae = writers.get(ln) and sae_models.get(ln)
-                if sae is None:
+                vnames = layer_to_variants.get(ln, [])
+                if not vnames:
                     continue
-                recon = None
-                with torch.no_grad():
-                    if warn_threshold is not None:
-                        forward_out = sae_models[ln](acts)
-                        if isinstance(forward_out, dict):
-                            out = forward_out.get("feature_acts")
-                            recon = forward_out.get("sae_out")
-                            if out is None:
-                                continue
-                        else:
-                            out = forward_out
-                    else:
-                        out = (
-                            sae_models[ln].encode(acts)
-                            if hasattr(sae_models[ln], "encode")
-                            else sae_models[ln](acts)
-                        )
-                out_float = out.detach().float()
-                batch_max = out_float.amax(dim=0)
-                outc = out_float.cpu()
                 provc = prov.detach().cpu().long()
                 stride_step = int(layer_cfg.get("stride", 1))
-                writers[ln].update(outc, provc, stride_step=stride_step, batch_max=batch_max)
-                if warn_threshold is not None and recon is not None:
-                    try:
-                        diff = (recon - acts).float()
-                        l2_val = float(torch.mean(diff.pow(2)).item())
-                        if l2_val > warn_threshold and rank == 0:
-                            logger.warning(
-                                "[index] High reconstruction L2 (layer=%s): %.4f > %.4f",
+                for vname in vnames:
+                    lv = _lv_key(ln, vname)
+                    writer = writers.get(lv)
+                    if writer is None or lv not in sae_models:
+                        continue
+
+                    sae = _activate_variant_sae(lv)
+                    recon = None
+                    with torch.no_grad():
+                        if warn_threshold is not None:
+                            forward_out = sae(acts)
+                            if isinstance(forward_out, dict):
+                                out = forward_out.get("feature_acts")
+                                recon = forward_out.get("sae_out")
+                                if out is None:
+                                    continue
+                            else:
+                                out = forward_out
+                        else:
+                            out = sae.encode(acts) if hasattr(sae, "encode") else sae(acts)
+                    out_float = out.detach().float()
+                    batch_max = out_float.amax(dim=0)
+                    outc = out_float.cpu()
+                    writer.update(outc, provc, stride_step=stride_step, batch_max=batch_max)
+                    if warn_threshold is not None and recon is not None:
+                        try:
+                            diff = (recon - acts).float()
+                            l2_val = float(torch.mean(diff.pow(2)).item())
+                            if l2_val > warn_threshold and rank == 0:
+                                logger.warning(
+                                    "[index] High reconstruction L2 (layer=%s, variant=%s): %.4f > %.4f",
+                                    ln,
+                                    vname,
+                                    l2_val,
+                                    warn_threshold,
+                                )
+                        except Exception as exc:
+                            logger.debug(
+                                "[index] Failed to compute L2 warning for layer %s variant=%s: %s",
                                 ln,
-                                l2_val,
-                                warn_threshold,
+                                vname,
+                                exc,
                             )
-                    except Exception as exc:
-                        logger.debug(
-                            "[index] Failed to compute L2 warning for layer %s: %s",
-                            ln,
-                            exc,
-                        )
 
             starved_local = 0 if any_data_local else 1
             t_starved = torch.tensor([starved_local], device=device, dtype=torch.int)
@@ -612,12 +814,12 @@ def run_indexing(config_path: str, *, l2_warn_threshold: Optional[float] = None)
 
             if cp_every_steps > 0 and cp_acc >= cp_every_steps:
                 pos = store.get_loader_position()
-                for ln in my_layers:
+                for lv in my_writer_keys:
                     save_layer_checkpoint(
                         cfg["indexing"]["out_prefix"],
                         cp_dir,
-                        ln,
-                        writers[ln],
+                        lv,
+                        writers[lv],
                         pos,
                         global_steps_accum,
                     )
@@ -729,23 +931,19 @@ def run_indexing(config_path: str, *, l2_warn_threshold: Optional[float] = None)
                     break
 
         if getattr(store, "sync_mode", "") != "owner_stream" and dist.is_initialized():
-            for ln in layers:
-                if ln in writers:
-                    device_mx = writers[ln].maxima.to(device, non_blocking=True)
-                else:
-                    device_mx = torch.zeros(dict_sizes[ln], device=device, dtype=torch.float32)
+            for lv in my_writer_keys:
+                device_mx = writers[lv].maxima.to(device, non_blocking=True)
                 dist.all_reduce(device_mx, op=dist.ReduceOp.MAX)
-                if ln in writers:
-                    writers[ln].maxima = device_mx.cpu()
+                writers[lv].maxima = device_mx.cpu()
 
         if rank == 0:
             pbar.n = pbar.total
             pbar.refresh()
             pbar.close()
 
-        for ln in my_layers:
-            writers[ln].finalize_and_write(progress_cb=None)
-            cp_path = cp_dir / f"{cfg['indexing']['out_prefix']}.{sanitize_layer_name(ln)}.pt"
+        for lv in my_writer_keys:
+            writers[lv].finalize_and_write(progress_cb=None)
+            cp_path = _cp_paths(cp_dir, cfg["indexing"]["out_prefix"], lv)
             try:
                 cp_path.unlink(missing_ok=True)
             except Exception:
@@ -753,21 +951,26 @@ def run_indexing(config_path: str, *, l2_warn_threshold: Optional[float] = None)
 
         # Write feature frequency metadata (topn mode only)
         if index_mode == "topn" and track_frequency:
-            freq_dir = out_dir / "feature_freq"
-            ensure_dir(freq_dir)
-            for ln in my_layers:
-                w = writers[ln]
+            for lv in my_writer_keys:
+                w = writers[lv]
                 if not isinstance(w, TopNAggregator):
                     continue
+                ln, vname = _lv_parse(lv)
+                freq_dir = variant_output_dirs.get(
+                    vname,
+                    _variant_out_dir(out_dir, vname, multi_variant_layout),
+                ) / "feature_freq"
+                ensure_dir(freq_dir)
                 _write_feature_frequency(
                     freq_dir, ln, w.get_feature_frequencies(),
                     w.get_total_samples_seen(),
                 )
                 if rank == 0:
                     logger.info(
-                        "[index] Feature frequency written for %s: "
+                        "[index] Feature frequency written for %s variant=%s: "
                         "%d active features / %d total, %d total samples",
                         ln,
+                        vname,
                         len(w.get_feature_frequencies()),
                         w.D,
                         w.get_total_samples_seen(),

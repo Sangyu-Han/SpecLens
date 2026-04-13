@@ -8,8 +8,9 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 from torchvision.transforms import InterpolationMode
 
-DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
-DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
+# SigLIP uses [-1, 1] normalization (mean=0.5, std=0.5 per channel)
+DEFAULT_MEAN = (0.5, 0.5, 0.5)
+DEFAULT_STD = (0.5, 0.5, 0.5)
 
 
 def _resolve_interpolation(mode: str | None) -> InterpolationMode:
@@ -42,17 +43,7 @@ def _build_transform(cfg: Dict[str, Any]) -> transforms.Compose:
     return transforms.Compose(aug)
 
 
-def build_clip_transform(cfg: Dict[str, Any], *, is_train: Optional[bool] = None) -> transforms.Compose:
-    """
-    Public helper to construct the standard CLIP vision transform.
-
-    Parameters
-    ----------
-    cfg:
-        Dictionary containing dataset preprocessing fields (image_size, mean, std, interpolation, is_train).
-    is_train:
-        Optional override for train/eval augmentation path. If omitted, value from cfg is used.
-    """
+def build_siglip_transform(cfg: Dict[str, Any], *, is_train: Optional[bool] = None) -> transforms.Compose:
     cfg_copy = dict(cfg)
     if is_train is not None:
         cfg_copy["is_train"] = bool(is_train)
@@ -80,7 +71,7 @@ class IndexedImageFolder(datasets.ImageFolder):
         }
 
 
-def clip_collate_fn(batch: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def siglip_collate_fn(batch: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = list(batch)
     pixel_values = torch.stack([item["pixel_values"] for item in items])
     labels: Optional[torch.Tensor]
@@ -106,7 +97,7 @@ def build_imagefolder_dataset(
     full_config: Optional[Dict[str, Any]] = None,
     **_,
 ) -> Dict[str, Any]:
-    """Build a simple ImageFolder dataset with CLIP-friendly preprocessing."""
+    """Build an ImageFolder dataset with SigLIP-friendly preprocessing."""
     root = Path(dataset_cfg["root"]).expanduser()
     split = dataset_cfg.get("split")
     if split:
@@ -128,7 +119,7 @@ def build_imagefolder_dataset(
 
     return {
         "dataset": dataset,
-        "collate_fn": clip_collate_fn,
+        "collate_fn": siglip_collate_fn,
         "sampler": sampler,
     }
 
@@ -140,28 +131,22 @@ def build_indexing_dataset(
     rank: int,
     **_,
 ):
-    """Dataset builder compatible with sae_index_main (returns dataset & sampler)."""
     cfg = dict(dataset_cfg)
     cfg.setdefault("is_train", False)
-    dataset_info = build_imagefolder_dataset(
-        cfg,
-        rank=rank,
-        world_size=world_size,
-    )
+    dataset_info = build_imagefolder_dataset(cfg, rank=rank, world_size=world_size)
     return dataset_info["dataset"], dataset_info["sampler"]
 
 
 def build_collate_fn(_dataset: Any, **_kwargs) -> Callable[[Iterable[Dict[str, Any]]], Dict[str, Any]]:
-    """Expose clip_collate_fn via registry for indexing pipeline."""
-    return clip_collate_fn
+    return siglip_collate_fn
 
 
 __all__ = [
     "DEFAULT_MEAN",
     "DEFAULT_STD",
-    "build_clip_transform",
+    "build_siglip_transform",
     "IndexedImageFolder",
-    "clip_collate_fn",
+    "siglip_collate_fn",
     "build_imagefolder_dataset",
     "build_indexing_dataset",
     "build_collate_fn",

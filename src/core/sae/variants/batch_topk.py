@@ -142,7 +142,13 @@ class BatchTopKSAE(BaseAutoencoder):
         orig_shape = acts.shape
         acts_flat = acts.reshape(-1, acts.shape[-1])
 
-        recon = acts_flat @ self.W_dec + self.b_dec
+        _gcenter = self.config.get("input_global_center_norm", False)
+        if _gcenter:
+            recon = acts_flat @ self.W_dec
+            if hasattr(self, "b_norm"):
+                recon = recon + self.b_norm
+        else:
+            recon = acts_flat @ self.W_dec + self.b_dec
 
         # Try to use the most recent normalization stats if the base class keeps them.
         x_mean = getattr(self, 'x_mean', torch.zeros_like(recon[:1]))
@@ -280,6 +286,43 @@ class BatchTopKSAE(BaseAutoencoder):
                 spatial_var_loss = spatial_var_coeff * var_per_feat.mean()
                 loss = loss + spatial_var_loss
 
+        # --- Orthogonality penalty (proactive anti-alignment prevention) ---
+        # Penalises W_enc columns that are anti-aligned with b_dec (or b_norm in gcenter).
+        # This fires from the very first gradient step (as soon as b_dec accumulates direction),
+        # preventing the anti-alignment that creates constant boosts BEFORE they form.
+        # Scale-invariant: uses normalized directions, so coefficient is easy to tune.
+        # penalty = relu(-cos(center, W_enc[:,i])).mean()  over all features
+        orth_coeff = float(self.config.get("orth_penalty_coeff", 0.0))
+        orth_loss = torch.tensor(0.0, device=x.device)
+        if orth_coeff > 0:
+            if _gcenter and hasattr(self, "b_norm"):
+                center_orth = self.b_norm
+            else:
+                center_orth = self.b_dec
+            c_norm = center_orth.norm()
+            if c_norm > 1e-6:
+                c_n = center_orth / c_norm                               # [D]
+                W_n = F.normalize(self.W_enc, dim=0)                     # [D, N]
+                orth_loss = orth_coeff * F.relu(-(c_n @ W_n)).mean()
+                loss = loss + orth_loss
+
+        # --- Constant boost penalty ---
+        # Directly penalizes the input-independent (constant) pre-activation component.
+        # const_boost[i] = b_enc[i] - center @ W_enc[:, i]
+        # where center = b_norm (gcenter mode) or b_dec (standard mode)
+        # Positive const_boost means feature i fires on every token regardless of content.
+        # Gradient flows through b_enc and W_enc, pulling them apart from the center direction.
+        cb_coeff = float(self.config.get("const_boost_penalty", 0.0))
+        cb_loss = torch.tensor(0.0, device=x.device)
+        if cb_coeff > 0:
+            if _gcenter and hasattr(self, "b_norm"):
+                center = self.b_norm
+            else:
+                center = self.b_dec
+            const_boost = self.b_enc - center @ self.W_enc   # [N]
+            cb_loss = cb_coeff * const_boost.clamp(min=0).mean()
+            loss = loss + cb_loss
+
         # --- Bias explained variance penalty ---
         bev_coeff = float(self.config.get("bev_penalty", 0.0))
         bev_loss = torch.tensor(0.0, device=x.device)
@@ -306,6 +349,8 @@ class BatchTopKSAE(BaseAutoencoder):
             "spatial_var_loss": spatial_var_loss,
             "freq_loss": freq_loss,
             "bev_loss": bev_loss,
+            "cb_loss": cb_loss,
+            "orth_loss": orth_loss,
             "n_high_freq": n_high_freq,
             "threshold": self.threshold,
             "explained_var": explained_var,

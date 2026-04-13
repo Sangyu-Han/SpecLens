@@ -428,11 +428,16 @@ class SAETrainingPipeline:
             stats["e2e/alpha_kl"] = float(alpha_kl.detach().item())
         labels = self._extract_labels(batch)
         if labels is not None and labels.ndim == 1:
-            orig_ce = F.cross_entropy(orig_logits, labels)
-            new_ce = F.cross_entropy(new_logits, labels)
-            stats["e2e/orig_ce"] = float(orig_ce.detach().item())
-            stats["e2e/recon_ce"] = float(new_ce.detach().item())
-            stats["e2e/delta_ce"] = float((new_ce - orig_ce).detach().item())
+            # Guard: logits must have enough classes to compute CE (e.g. CLIP ViT has no
+            # classification head, so logits.shape[-1] may be the embedding dim, not num_classes).
+            n_classes = orig_logits.shape[-1] if orig_logits.ndim >= 2 else 0
+            max_label = int(labels.max().item()) if labels.numel() > 0 else 0
+            if n_classes > max_label:
+                orig_ce = F.cross_entropy(orig_logits, labels)
+                new_ce = F.cross_entropy(new_logits, labels)
+                stats["e2e/orig_ce"] = float(orig_ce.detach().item())
+                stats["e2e/recon_ce"] = float(new_ce.detach().item())
+                stats["e2e/delta_ce"] = float((new_ce - orig_ce).detach().item())
         return total, stats
 
     def _print_buffer_progress(self, force: bool = False):
@@ -982,9 +987,11 @@ class SAETrainingPipeline:
                 self.my_lv_keys.append(lv)
                 lname_to_vnames.setdefault(lname, []).append(vname)
 
-        # Register multi-variant layers with the activation store (fan-out support)
+        # Register variant layers with the activation store (fan-out support).
+        # Single-variant layers also require registration so that next_batch(variant=vname)
+        # can find the variant queue (bug fix: was "> 1", now ">= 1").
         for lname, vnames in lname_to_vnames.items():
-            if len(vnames) > 1:
+            if len(vnames) >= 1:
                 self.activation_store.register_variants(lname, vnames)
                 logger.info("[Rank %d] Shared buffer: layer '%s' → %d variants: %s",
                             self.rank, lname, len(vnames), vnames)
@@ -1065,6 +1072,8 @@ class SAETrainingPipeline:
                     "spatial_var_freq_threshold": tr.get("spatial_var_freq_threshold", 0.01),
                     "freq_penalty_coeff": merged_over.get("freq_penalty_coeff", tr.get("freq_penalty_coeff", 0.0)),
                     "bev_penalty": merged_over.get("bev_penalty", tr.get("bev_penalty", 0.0)),
+                    "const_boost_penalty": merged_over.get("const_boost_penalty", tr.get("const_boost_penalty", 0.0)),
+                    "orth_penalty_coeff": merged_over.get("orth_penalty_coeff", tr.get("orth_penalty_coeff", 0.0)),
                     # RA-SAE specific
                     "input_global_center_norm": tr.get("input_global_center_norm", False),
                     "delta": merged_over.get("delta", tr.get("delta", 0.5)),
@@ -2102,7 +2111,7 @@ class SAETrainingPipeline:
                     
                     # 집계용(마이크로 합산)
                     sum_loss = 0.0; sum_l1 = 0.0; sum_l2 = 0.0; sum_aux = 0.0; sum_freq = 0.0
-                    sum_svar = 0.0; sum_bev_loss = 0.0
+                    sum_svar = 0.0; sum_bev_loss = 0.0; sum_cb_loss = 0.0; sum_orth_loss = 0.0
                     sum_n = 0; last_thr = None
 
                     # sparsity(스텝 평균), k_eff(샘플당 비영 활성 수), 양의 활성 평균 크기
@@ -2174,6 +2183,8 @@ class SAETrainingPipeline:
                             sum_freq += float(out.get("freq_loss", torch.tensor(0.)).item()) * n
                             sum_svar += float(out.get("spatial_var_loss", torch.tensor(0.)).item()) * n
                             sum_bev_loss += float(out.get("bev_loss", torch.tensor(0.)).item()) * n
+                            sum_cb_loss += float(out.get("cb_loss", torch.tensor(0.)).item()) * n
+                            sum_orth_loss += float(out.get("orth_loss", torch.tensor(0.)).item()) * n
 
                         # Capture diagnostic metrics before freeing
                         if isinstance(out, dict):
@@ -2364,6 +2375,18 @@ class SAETrainingPipeline:
                             payload[f"{safe}/by_step/bev_loss"] = mean_bev_loss
                             payload[f"{safe}/by_token/bev_loss"] = mean_bev_loss
 
+                        # const_boost penalty loss
+                        mean_cb_loss = sum_cb_loss / denom
+                        if mean_cb_loss > 0:
+                            payload[f"{safe}/by_step/cb_loss"] = mean_cb_loss
+                            payload[f"{safe}/by_token/cb_loss"] = mean_cb_loss
+
+                        # orth penalty loss
+                        mean_orth_loss = sum_orth_loss / denom
+                        if mean_orth_loss > 0:
+                            payload[f"{safe}/by_step/orth_loss"] = mean_orth_loss
+                            payload[f"{safe}/by_token/orth_loss"] = mean_orth_loss
+
                         # bias-only explained variance (from last micro-batch)
                         if _last_bev is not None:
                             payload[f"{safe}/by_step/bias_explained_var"] = _last_bev
@@ -2405,6 +2428,8 @@ class SAETrainingPipeline:
                         _svar = (sum_svar / denom) if denom > 0 else 0
                         _bev_s = f" bev={_last_bev:.4f}" if _last_bev is not None else ""
                         _nhf_s = f" nhf={_last_nhf}" if _last_nhf is not None else ""
+                        _cb_s = f" cb={sum_cb_loss/denom:.4f}" if denom > 0 and sum_cb_loss > 0 else ""
+                        _orth_s = f" orth={sum_orth_loss/denom:.4f}" if denom > 0 and sum_orth_loss > 0 else ""
                         _e2e_s = ""
                         if e2e_stats:
                             _e2e_total = e2e_stats.get("e2e/total")
@@ -2428,7 +2453,7 @@ class SAETrainingPipeline:
                         print(
                             f"[online] {lv} step={steps_done[lv]} "
                             f"loss={mean_loss:.4f} l2={mean_l2:.4f} aux={mean_aux:.4f} "
-                            f"svar={_svar:.4f}{_bev_s}{_nhf_s} "
+                            f"svar={_svar:.4f}{_bev_s}{_nhf_s}{_cb_s}{_orth_s} "
                             f"rel_l2={_rl2:.4f} sparsity={_sparsity:.6f} k_eff={_k_eff_v:.1f} "
                             f"dead_frac={_df:.4f}{_e2e_s}{_freq_s}",
                             flush=True,

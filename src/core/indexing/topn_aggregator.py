@@ -80,6 +80,9 @@ class TopNAggregator:
         self._idx_x = self._prov_index.get("x")
         self._idx_prompt_id = self._prov_index.get("prompt_id")
         self._idx_uid = self._prov_index.get("uid")
+        self._prov_default_row = tuple(
+            int(_PROV_DEFAULTS.get(name, 0)) for name in self.prov_cols
+        )
 
         # Feature frequency: count unique sample_ids per feature
         if self.track_frequency:
@@ -102,6 +105,9 @@ class TopNAggregator:
         self.run_epoch = 0
         self.run_b_in_epoch = 0
         self.global_steps = 0
+
+        self._heap_mins_np = np.full(self.D, -np.inf, dtype=np.float64)
+        self._heap_sizes_np = np.zeros(self.D, dtype=np.int32)
 
     # ------------------------------------------------------------------ #
     # Dedupe helpers (simplified vs DecileTopKParquet — heap only)
@@ -134,7 +140,7 @@ class TopNAggregator:
                 return
 
     # ------------------------------------------------------------------ #
-    # Update (hot path) — vectorized via torch.topk
+    # Update (hot path) — vectorized sparse candidate filtering
     # ------------------------------------------------------------------ #
     def update(
         self,
@@ -148,21 +154,11 @@ class TopNAggregator:
         acts_cpu: [N, D] float32
         prov_cpu: [N, ?] long
 
-        Vectorized hot path: uses torch.topk(acts_cpu, n_internal, dim=0) to find
-        top-n_internal token candidates per feature in one C++ call, replacing the
-        original O(N) Python loop + N torch.nonzero calls.
-
-        Correctness guarantee: taking top-n_internal tokens per feature per batch
-        is sufficient because any batch entry ranked > n_internal for feature d has
-        value <= top_vals[n_internal-1, d]. After inserting the top-n_internal batch
-        entries, the heap minimum is >= top_vals[n_internal-1, d], so the skipped
-        entries cannot improve the heap.
-
-        Early break: topk returns values in descending order, so when v <= heap_min
-        for feature d, all remaining candidates for d are also <= heap_min → break.
+        Vectorized hot path: one torch.nonzero extracts sparse candidates, then NumPy
+        filters them against per-feature heap thresholds before Python touches them.
+        We also pre-pack provenance once per token so the inner loop no longer pays
+        repeated ndarray->list conversions for every active feature firing.
         """
-        import numpy as np
-
         N, D = acts_cpu.shape
 
         # Update maxima
@@ -187,8 +183,7 @@ class TopNAggregator:
         total_seen = self._total_samples_seen
         idx_sample_id = self._idx_sample_id
         stride_step_int = int(stride_step)
-        prov_cols = self.prov_cols
-        _pd = _PROV_DEFAULTS
+        prov_default_row = self._prov_default_row
 
         # ── provenance ──
         if prov_cpu.ndim == 2:
@@ -197,37 +192,44 @@ class TopNAggregator:
             prov_np = prov_cpu.view(N, -1).numpy()
         prov_ncols = prov_np.shape[1]
 
+        if prov_ncols == prov_cols_len:
+            prov_padded = prov_np
+        else:
+            prov_padded = np.empty((N, prov_cols_len), dtype=np.int64)
+            if prov_cols_len:
+                prov_padded[:] = np.asarray(prov_default_row, dtype=np.int64)
+            if prov_ncols:
+                prov_padded[:, : min(prov_ncols, prov_cols_len)] = prov_np[
+                    :, : min(prov_ncols, prov_cols_len)
+                ]
+
         # ── track total_seen: O(N) ──
         if track_freq and idx_sample_id is not None and idx_sample_id < prov_ncols:
-            total_seen.update(int(x) for x in prov_np[:, idx_sample_id])
+            total_seen.update(int(x) for x in prov_padded[:, idx_sample_id].tolist())
 
-        # ── per-feature default prov padding ──
-        _prov_defaults_list: List[int] = [
-            int(_pd.get(prov_cols[ci] if ci < len(prov_cols) else None, 0))
-            for ci in range(prov_cols_len)
+        # Timing: materialize per-token provenance tuples once; each token fires many
+        # features, so reusing the packed tuple is cheaper than per-candidate tolist().
+        prov_rows: List[tuple[int, ...]] = [
+            tuple(row) for row in prov_padded.tolist()
         ]
 
         # ── per-feature batch max for early-skip ──
-        if batch_max is not None:
-            bmax_np: np.ndarray = max_vals.numpy()  # [D] already on CPU
-        else:
-            bmax_np = acts_cpu.max(dim=0).values.numpy()
+        bmax_np: np.ndarray = max_vals.numpy()  # [D] already on CPU
 
         # Heap-mins array: maintained for O(D) vectorized early-skip comparison
-        if not hasattr(self, "_heap_mins_np"):
-            self._heap_mins_np: np.ndarray = np.full(D, -1e38, dtype=np.float64)
         heap_mins: np.ndarray = self._heap_mins_np
+        heap_sizes: np.ndarray = self._heap_sizes_np
+        candidate_thresholds = np.where(
+            heap_sizes >= self.n_internal,
+            heap_mins,
+            -np.inf,
+        )
 
         # ── vectorized nonzero: one C++ call → M (tok_idx, feat_idx, val) triples ──
-        # This replaces N individual torch.nonzero(row) calls (original bottleneck).
-        # We filter BEFORE extracting: only consider features where batch_max > heap_min
-        # so that inactive features are entirely skipped.
-        active_mask_d = bmax_np > heap_mins  # [D] bool
-        active_d_arr: np.ndarray = np.where(active_mask_d)[0]  # indices of active features
-        if active_d_arr.size == 0:
+        active_mask_d = bmax_np > candidate_thresholds  # [D] bool
+        if not active_mask_d.any():
             return
 
-        # One nonzero call on full acts to get all (tok, feat) pairs
         nz = torch.nonzero(acts_cpu, as_tuple=False)  # [M, 2]: M ≈ N×K active entries
         if nz.numel() == 0:
             return
@@ -235,55 +237,60 @@ class TopNAggregator:
         tok_ids_np: np.ndarray  = nz[:, 0].numpy()     # [M]
         vals_np: np.ndarray     = acts_cpu[nz[:, 0], nz[:, 1]].numpy()  # [M]
 
-        # Filter to entries belonging to active features
-        in_active: np.ndarray = active_mask_d[feat_ids_np]  # [M] bool, vectorized
-        if not in_active.any():
+        # Timing: batch filter in NumPy so the Python loop only sees candidates that
+        # can still improve a heap. Underfilled heaps use -inf, so we preserve safety.
+        candidate_mask: np.ndarray = (
+            active_mask_d[feat_ids_np]
+            & (vals_np > candidate_thresholds[feat_ids_np])
+        )
+        if not candidate_mask.any():
             return
-        feat_ids_f = feat_ids_np[in_active]
-        tok_ids_f  = tok_ids_np[in_active]
-        vals_f     = vals_np[in_active]
+        feat_ids_f = feat_ids_np[candidate_mask]
+        tok_ids_f  = tok_ids_np[candidate_mask]
+        vals_f     = vals_np[candidate_mask]
 
-        # Sort by feature id so entries for each feature are contiguous
-        sort_order = np.argsort(feat_ids_f, kind='stable')
+        # Sort by feature id and descending value so each feature can early-break once
+        # its heap threshold is met instead of scanning all surviving candidates.
+        sort_order = np.lexsort((-vals_f, feat_ids_f))
         feat_ids_s = feat_ids_f[sort_order]
         tok_ids_s  = tok_ids_f[sort_order]
         vals_s     = vals_f[sort_order]
 
-        # Pre-convert to Python lists: list element access is 3-5x faster than
-        # numpy scalar access in a Python for loop.
+        # Pre-convert to Python lists: list element access is faster than numpy scalar
+        # access inside the remaining per-candidate heap update loop.
         vals_list: list  = vals_s.tolist()
         tok_list: list   = tok_ids_s.tolist()
 
         # Process per feature using counts from np.unique (avoids np.append)
         unique_feats, boundaries, counts = np.unique(feat_ids_s, return_index=True, return_counts=True)
-
-        pv_len     = min(prov_ncols, prov_cols_len)
         n_internal = self.n_internal
         heaps      = self.heaps
+        freq_sample_ids = None
+        if track_freq and idx_sample_id is not None and idx_sample_id < prov_cols_len:
+            freq_sample_ids = prov_padded[tok_ids_s, idx_sample_id]
+        allow_batch_cap = self._dedupe_key_fn is None
 
         for uf_idx in range(len(unique_feats)):
             d     = int(unique_feats[uf_idx])
             start = int(boundaries[uf_idx])
             end   = start + int(counts[uf_idx])
+            if freq_sample_ids is not None:
+                freq_sets[d].update(freq_sample_ids[start:end].tolist())
+            if allow_batch_cap and end - start > n_internal:
+                end = start + n_internal
             heap  = heaps[d]
             heap_min = float(heap_mins[d])
+            heap_size = int(heap_sizes[d])
 
             for m in range(start, end):
                 v = vals_list[m]  # Python float from pre-converted list
-                if len(heap) >= n_internal and v <= heap_min:
-                    continue  # below current heap threshold
+                if heap_size >= n_internal and v <= heap_min:
+                    break  # sorted descending within feature
 
                 tok_idx   = tok_list[m]   # Python int from pre-converted list
-                prov_row  = prov_np[tok_idx]
-                prov_vals: List[int] = prov_row[:pv_len].tolist()
-                if pv_len < prov_cols_len:
-                    prov_vals = prov_vals + _prov_defaults_list[pv_len:]
+                prov_vals = prov_rows[tok_idx]
 
                 item = (v, *prov_vals, stride_step_int)
-
-                # Frequency tracking
-                if track_freq and idx_sample_id is not None and idx_sample_id < len(prov_vals):
-                    freq_sets[d].add(prov_vals[idx_sample_id])
 
                 # Dedupe check
                 dedupe_key = None
@@ -295,25 +302,31 @@ class TopNAggregator:
                             continue
                         self._dedupe_remove_from_heap(d, existing)
                         self._dedupe_store[d].pop(dedupe_key, None)
+                        heap_size = len(heap)
+                        heap_min = heap[0][0] if heap else -np.inf
 
                 # Min-heap insert
                 removed = None
-                if len(heap) < n_internal:
+                if heap_size < n_internal:
                     heapq.heappush(heap, item)
+                    heap_size += 1
                 elif v > heap_min:
                     removed = heapq.heapreplace(heap, item)
                 else:
-                    continue
+                    break
 
                 # Update heap_min after any heap change
                 heap_min = heap[0][0]
                 heap_mins[d] = heap_min
+                heap_sizes[d] = heap_size
 
                 # Dedupe bookkeeping
                 if self._dedupe_key_fn is not None:
                     if removed is not None:
                         self._dedupe_forget_item(d, removed)
                     self._dedupe_register(d, item, dedupe_key)
+            heap_mins[d] = heap_min if heap else -np.inf
+            heap_sizes[d] = heap_size
 
     # ------------------------------------------------------------------ #
     # Finalize & write to Parquet
@@ -321,62 +334,106 @@ class TopNAggregator:
     def finalize_and_write(
         self, *, progress_cb: Optional[Callable[[int], None]] = None
     ) -> int:
-        rows: List[Dict[str, Any]] = []
         prov_cols_len = self._prov_len
+        total_wrote = self.estimate_final_rows()
+        if total_wrote == 0:
+            return 0
 
-        def _prov_value(values: tuple, idx: Optional[int], default: int) -> int:
-            if idx is None or idx >= len(values):
-                return default
-            return int(values[idx])
+        units = [0] * total_wrote
+        scores = [0.0] * total_wrote
+        ranks = [0] * total_wrote
+        sample_ids = [0] * total_wrote
+        frame_idxs = [0] * total_wrote
+        ys = [0] * total_wrote
+        xs = [0] * total_wrote
+        prompt_ids = [0] * total_wrote
+        uids = [0] * total_wrote
+        stride_steps = [0] * total_wrote
 
-        total_wrote = 0
+        write_idx = 0
+        idx_sample_id = self._idx_sample_id
+        idx_frame_idx = self._idx_frame_idx
+        idx_y = self._idx_y
+        idx_x = self._idx_x
+        idx_prompt_id = self._idx_prompt_id
+        idx_uid = self._idx_uid
+        default_row = self._prov_default_row
+
         for d in range(self.D):
             heap = self.heaps[d]
             if not heap:
                 continue
             # Sort descending by score, take top_n
             best = sorted(heap, key=lambda x: -x[0])[: self.top_n]
-            for rnk, item in enumerate(best):
-                v = item[0]
-                prov_vals = item[1 : 1 + prov_cols_len]
-                s_step = item[-1]
-                rows.append(
-                    {
-                        "run_id": self.fp.run_id,
-                        "layer": self.layer,
-                        "unit": int(d),
-                        "score": float(v),
-                        "decile": 0,  # topn mode: always 0
-                        "rank_in_decile": int(rnk),
-                        "sample_id": _prov_value(
-                            prov_vals, self._idx_sample_id, _PROV_DEFAULTS["sample_id"]
-                        ),
-                        "frame_idx": _prov_value(
-                            prov_vals,
-                            self._idx_frame_idx,
-                            _PROV_DEFAULTS["frame_idx"],
-                        ),
-                        "y": _prov_value(prov_vals, self._idx_y, _PROV_DEFAULTS["y"]),
-                        "x": _prov_value(prov_vals, self._idx_x, _PROV_DEFAULTS["x"]),
-                        "prompt_id": _prov_value(
-                            prov_vals,
-                            self._idx_prompt_id,
-                            _PROV_DEFAULTS["prompt_id"],
-                        ),
-                        "uid": _prov_value(
-                            prov_vals, self._idx_uid, _PROV_DEFAULTS["uid"]
-                        ),
-                        "stride_step": int(s_step),
-                        "meta_json": "",
-                    }
-                )
-                total_wrote += 1
-                if progress_cb:
-                    progress_cb(1)
+            n_best = len(best)
+            if n_best == 0:
+                continue
 
-        if rows:
-            self.ledger.write_rows(rows, rank=self.rank)
-        return total_wrote
+            # Timing: fill column buffers directly and hand them to the ledger in one
+            # write. This removes the finalize row-dict loop plus ledger's old
+            # schema x rows dict-walk, which dominated cProfile on large flushes.
+            for rnk, item in enumerate(best):
+                prov_vals = item[1 : 1 + prov_cols_len]
+                if len(prov_vals) < prov_cols_len:
+                    prov_vals = prov_vals + default_row[len(prov_vals) :]
+
+                units[write_idx] = int(d)
+                scores[write_idx] = float(item[0])
+                ranks[write_idx] = int(rnk)
+                sample_ids[write_idx] = (
+                    int(prov_vals[idx_sample_id])
+                    if idx_sample_id is not None
+                    else _PROV_DEFAULTS["sample_id"]
+                )
+                frame_idxs[write_idx] = (
+                    int(prov_vals[idx_frame_idx])
+                    if idx_frame_idx is not None
+                    else _PROV_DEFAULTS["frame_idx"]
+                )
+                ys[write_idx] = (
+                    int(prov_vals[idx_y])
+                    if idx_y is not None
+                    else _PROV_DEFAULTS["y"]
+                )
+                xs[write_idx] = (
+                    int(prov_vals[idx_x])
+                    if idx_x is not None
+                    else _PROV_DEFAULTS["x"]
+                )
+                prompt_ids[write_idx] = (
+                    int(prov_vals[idx_prompt_id])
+                    if idx_prompt_id is not None
+                    else _PROV_DEFAULTS["prompt_id"]
+                )
+                uids[write_idx] = (
+                    int(prov_vals[idx_uid])
+                    if idx_uid is not None
+                    else _PROV_DEFAULTS["uid"]
+                )
+                stride_steps[write_idx] = int(item[-1])
+                write_idx += 1
+
+            if progress_cb is not None:
+                progress_cb(n_best)
+
+        columns = {
+            "run_id": [self.fp.run_id] * write_idx,
+            "layer": [self.layer] * write_idx,
+            "unit": units[:write_idx],
+            "score": scores[:write_idx],
+            "decile": [0] * write_idx,
+            "rank_in_decile": ranks[:write_idx],
+            "sample_id": sample_ids[:write_idx],
+            "frame_idx": frame_idxs[:write_idx],
+            "y": ys[:write_idx],
+            "x": xs[:write_idx],
+            "prompt_id": prompt_ids[:write_idx],
+            "uid": uids[:write_idx],
+            "stride_step": stride_steps[:write_idx],
+            "meta_json": [""] * write_idx,
+        }
+        self.ledger.write_rows(columns, rank=self.rank)
+        return write_idx
 
     # ------------------------------------------------------------------ #
     # Feature frequency
@@ -425,10 +482,12 @@ class TopNAggregator:
         self.heaps = sd["heaps"]
         # Rebuild _heap_mins_np from loaded heaps
         D_loaded = int(sd["D"])
-        self._heap_mins_np = np.full(D_loaded, -1e38, dtype=np.float64)
+        self._heap_mins_np = np.full(D_loaded, -np.inf, dtype=np.float64)
+        self._heap_sizes_np = np.zeros(D_loaded, dtype=np.int32)
         for _d, _h in enumerate(self.heaps):
             if _h:
                 self._heap_mins_np[_d] = _h[0][0]
+                self._heap_sizes_np[_d] = len(_h)
         self.maxima = (
             sd["maxima"].clone().cpu()
             if isinstance(sd["maxima"], torch.Tensor)
@@ -449,6 +508,9 @@ class TopNAggregator:
             self._idx_x = self._prov_index.get("x")
             self._idx_prompt_id = self._prov_index.get("prompt_id")
             self._idx_uid = self._prov_index.get("uid")
+            self._prov_default_row = tuple(
+                int(_PROV_DEFAULTS.get(name, 0)) for name in self.prov_cols
+            )
 
         # Frequency: exact sets are not serialized (too large).
         # On resume, frequency tracking restarts from zero.

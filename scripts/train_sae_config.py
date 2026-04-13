@@ -20,7 +20,9 @@ from src.core.sae.train.runner import SAETrainingPipeline, main_worker
 PACK_DEFAULT_CONFIGS = {
     "sam2": "configs/sam2_sav_batchtopk_train_batchtopk.yaml",
     "clip": "configs/clip_imagenet_train.yaml",
+    "siglip": "configs/siglip_imagenet_train.yaml",
     "dinov2": "configs/dinov2_imagenet_train.yaml",
+    "dinov3": "configs/dinov3_imagenet_train.yaml",
     "resnet": "configs/resnet18_imagenet_train.yaml",
     "mask2former": "configs/mask2former_sav_train.yaml",
 }
