@@ -5,7 +5,26 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
-from torch.nn.attention import SDPBackend, sdpa_kernel
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel  # PyTorch >= 2.2
+except ImportError:
+    # PyTorch 2.1 compatibility
+    from torch.backends.cuda import sdp_kernel as _sdp_kernel_old
+    import contextlib, enum
+
+    class SDPBackend(enum.Enum):
+        MATH = 0
+        FLASH_ATTENTION = 1
+        EFFICIENT_ATTENTION = 2
+        CUDNN_ATTENTION = 3
+
+    @contextlib.contextmanager
+    def sdpa_kernel(backends):
+        use_math = SDPBackend.MATH in backends
+        use_flash = SDPBackend.FLASH_ATTENTION in backends
+        use_eff = SDPBackend.EFFICIENT_ATTENTION in backends
+        with _sdp_kernel_old(enable_flash=use_flash, enable_math=use_math, enable_mem_efficient=use_eff):
+            yield
 @dataclass
 class ObjectiveTensor:
     tensor: torch.Tensor
@@ -304,7 +323,6 @@ def build_ig_backend(
             set_alpha(alpha)
             # forward must run AFTER setting alpha so the anchor module outputs the path point
             if force_sdpa_math:
-                from torch.nn.attention import sdpa_kernel, SDPBackend
                 with sdpa_kernel(backends=[SDPBackend.MATH]):
                     do_forward()
             else:

@@ -9,7 +9,8 @@ dataset:
   batch_size: 32
   shuffle: true
   drop_last: true
-  image_size: 224
+  # DINOv3 pretrained with 256x256 (crop_pct=1.0)
+  image_size: 256
   interpolation: bicubic
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
@@ -17,9 +18,8 @@ dataset:
 
 model:
   loader: src.packs.dinov3.train.factories:load_model
-  hf_path: facebook/dinov3-vits16-pretrain-lvd1689m
+  name: vit_small_patch16_dinov3
   pretrained: true
-  trust_remote_code: true
   dtype: float32
 
 
@@ -44,11 +44,11 @@ sae:
     factory: src.packs.dinov3.train.factories:create_store
   layers:
     # low layer
-    - model.model.layer.2
+    - model.blocks.2
     # middle layer
-    - model.model.layer.6
-    # high layer (second-to-last; last is model.layer.11)
-    - model.model.layer.10
+    - model.blocks.6
+    # high layer (second-to-last; last is blocks.11)
+    - model.blocks.10
   output:
     save_path: outputs/dinov3_imagenet_sae_batchtopk
   debug:
@@ -85,7 +85,7 @@ sae:
     n_batches_to_dead: 20
     dtype: float32
     seed: 42
-    stride: 1
+    stride: 8
 
 
 validation:
@@ -103,7 +103,7 @@ validation:
     batch_size: 64
     shuffle: true
     drop_last: false
-    image_size: 224
+    image_size: 256
     is_train: false
     interpolation: bicubic
     mean: [0.485, 0.456, 0.406]

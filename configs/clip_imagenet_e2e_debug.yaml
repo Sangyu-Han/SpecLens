@@ -15,7 +15,7 @@ dataset:
 
 model:
   loader: src.packs.clip.train.factories:load_model
-  name: vit_base_patch16_clip_224
+  name: vit_base_patch16_clip_224.laion2b_ft_in12k_in1k
   pretrained: false
   dtype: float32
 

@@ -1,29 +1,31 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+import timm
 import torch
-from transformers import AutoConfig, AutoModel
+import torch.nn as nn
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "facebook/dinov3-vits16-pretrain-lvd1689m"
+DEFAULT_MODEL = "vit_small_patch16_dinov3"
 
 
-def _resolve_dtype(dtype: Optional[str | torch.dtype]) -> Optional[torch.dtype]:
-    if dtype is None:
-        return None
-    if isinstance(dtype, torch.dtype):
-        return dtype
-    key = str(dtype).lower()
-    if key in ("bf16", "bfloat16", "torch.bfloat16"):
-        return torch.bfloat16
-    if key in ("fp16", "float16", "torch.float16", "half"):
-        return torch.float16
-    if key in ("fp32", "float32", "torch.float32", "float"):
-        return torch.float32
-    raise ValueError(f"Unsupported dtype: {dtype}")
+def _load_state_dict(model: nn.Module, ckpt_path: Path, *, strict: bool = False) -> None:
+    state = torch.load(str(ckpt_path), map_location="cpu")
+    if isinstance(state, dict):
+        if "state_dict" in state:
+            state = state["state_dict"]
+        elif "model" in state:
+            state = state["model"]
+    if isinstance(state, dict):
+        state = {k.replace("module.", "", 1): v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=strict)
+    LOGGER.info(
+        "[dinov3] load_state_dict strict=%s missing=%d unexpected=%d", strict, len(missing), len(unexpected)
+    )
 
 
 def load_dinov3_model(
@@ -34,50 +36,40 @@ def load_dinov3_model(
     world_size: int = 1,
     full_config: Optional[Dict[str, Any]] = None,
     **_,
-):
-    """Load a DINOv3 model from HuggingFace Transformers."""
-    cfg = model_cfg or {}
-    device = torch.device(device)
-    name = cfg.get("hf_path") or cfg.get("name") or DEFAULT_MODEL
-    pretrained = bool(cfg.get("pretrained", True))
-    trust_remote = bool(cfg.get("trust_remote_code", True))
-    revision = cfg.get("revision")
-    attn_impl = cfg.get("attn_impl") or cfg.get("attn_implementation")
-    dtype = _resolve_dtype(cfg.get("dtype") or (full_config or {}).get("dtype"))
-    low_cpu_mem = bool(cfg.get("low_cpu_mem", True))
-    device_map = cfg.get("device_map")
+) -> nn.Module:
+    """Create a timm DINOv3 Vision Transformer and move it to the requested device."""
+    name = model_cfg.get("name", DEFAULT_MODEL)
+    pretrained = bool(model_cfg.get("pretrained", True))
+    init_kwargs = dict(model_cfg.get("init_kwargs") or {})
 
-    model_kwargs: Dict[str, Any] = {
-        "trust_remote_code": trust_remote,
-    }
-    if revision is not None:
-        model_kwargs["revision"] = revision
-    if attn_impl is not None:
-        model_kwargs["attn_implementation"] = attn_impl
-    if dtype is not None:
-        model_kwargs["torch_dtype"] = dtype
-    if device_map is not None:
-        model_kwargs["device_map"] = device_map
-    if low_cpu_mem:
-        model_kwargs["low_cpu_mem_usage"] = True
-
-    if pretrained:
-        model = AutoModel.from_pretrained(name, **model_kwargs)
+    ckpt_path = model_cfg.get("ckpt") or model_cfg.get("checkpoint")
+    if ckpt_path:
+        init_kwargs.setdefault("pretrained", False)
     else:
-        base_cfg = AutoConfig.from_pretrained(name, trust_remote_code=trust_remote, revision=revision)
-        model = AutoModel.from_config(base_cfg, trust_remote_code=trust_remote)
-        if dtype is not None:
-            model = model.to(dtype)
+        init_kwargs.setdefault("pretrained", pretrained)
+
+    try:
+        model = timm.create_model(name, **init_kwargs)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Failed to create timm model '{name}' with args {init_kwargs}") from exc
 
     model.eval()
-    if device_map is None:
-        model.to(device)
+    model.to(device)
 
-    if dtype is not None and device_map is None:
-        model = model.to(dtype)
-
-    if pretrained and rank == 0:
+    if ckpt_path:
+        path = Path(ckpt_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        _load_state_dict(model, path, strict=bool(model_cfg.get("strict_load", False)))
+    elif pretrained and rank == 0:
         LOGGER.info("[dinov3] Loaded pretrained weights for %s", name)
+
+    dtype = model_cfg.get("dtype")
+    if dtype:
+        try:
+            model = model.to(getattr(torch, dtype))
+        except AttributeError as exc:
+            raise ValueError(f"Unsupported dtype '{dtype}' for DINOv3 model conversion") from exc
 
     return model
 

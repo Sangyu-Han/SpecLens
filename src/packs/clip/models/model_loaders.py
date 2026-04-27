@@ -37,7 +37,7 @@ def load_clip_model(
     **_,
 ) -> nn.Module:
     """Create a timm CLIP Vision Transformer and move it to the requested device."""
-    name = model_cfg.get("name", "vit_base_patch16_clip_224")
+    name = model_cfg.get("name", "vit_base_patch16_clip_224.laion2b_ft_in12k_in1k")
     pretrained = bool(model_cfg.get("pretrained", True))
     init_kwargs = dict(model_cfg.get("init_kwargs") or {})
 

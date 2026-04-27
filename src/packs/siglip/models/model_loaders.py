@@ -40,6 +40,18 @@ def load_siglip_model(
     pretrained = bool(model_cfg.get("pretrained", True))
     init_kwargs = dict(model_cfg.get("init_kwargs") or {})
 
+    # Match the training/indexing environment used for the SigLIP 50k runs.
+    # In newer timm versions this model name resolves to the `v2_webli` weights,
+    # but older local timm builds may still default to the older `webli` entry.
+    # Force the pretrained source explicitly so local validation uses the same
+    # variant as the server-side training/indexing setup.
+    if str(name) == "vit_base_patch16_siglip_224":
+        overlay = dict(init_kwargs.get("pretrained_cfg_overlay") or {})
+        overlay.setdefault("hf_hub_id", "timm/vit_base_patch16_siglip_224.v2_webli")
+        overlay.setdefault("tag", "v2_webli")
+        overlay.setdefault("hf_hub_filename", "pytorch_model.bin")
+        init_kwargs["pretrained_cfg_overlay"] = overlay
+
     ckpt_path = model_cfg.get("ckpt") or model_cfg.get("checkpoint")
     if ckpt_path:
         init_kwargs.setdefault("pretrained", False)

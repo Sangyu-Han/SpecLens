@@ -23,12 +23,12 @@ def _unwrap_module(model: nn.Module) -> nn.Module:
 
 
 class Dinov3VisionAdapter(ModelAdapter):
-    """Adapter to run DINOv3 vision encoders (HuggingFace) inside the universal activation store.
+    """Adapter to run timm DINOv3 vision encoders inside the universal activation store.
 
-    DINOv3 ViT structure (DINOv3ViTModel):
-      - embeddings       : patch embeddings + RoPE
-      - model.layer.{i}  : transformer blocks (DINOv3ViTLayer), direct Tensor output
-      - norm             : final LayerNorm
+    DINOv3 timm structure (VisionTransformer):
+      - patch_embed       : patch embedding
+      - blocks.{i}        : transformer blocks, same as CLIP/SigLIP
+      - norm              : final LayerNorm
     """
 
     def __init__(self, model: nn.Module, device: Optional[Union[str, torch.device]] = None):
@@ -41,25 +41,19 @@ class Dinov3VisionAdapter(ModelAdapter):
         self.current_meta: Optional[Dict[str, Any]] = None
 
     def get_hook_points(self) -> List[str]:
-        base: List[str] = []
+        base = []
         model = _unwrap_module(self.model)
-
-        if hasattr(model, "embeddings"):
-            base.append("embeddings")
-
-        # DINOv3ViTModel: model.model.layer is the encoder ModuleList
-        encoder = getattr(model, "model", None)
-        if encoder is not None and hasattr(encoder, "layer"):
+        if hasattr(model, "patch_embed"):
+            base.append("patch_embed")
+        if hasattr(model, "blocks"):
             try:
-                n_blocks = len(encoder.layer)
+                n_blocks = len(model.blocks)
             except TypeError:
                 n_blocks = 0
             for idx in range(n_blocks):
-                base.append(f"model.layer.{idx}")
-
+                base.append(f"blocks.{idx}")
         if hasattr(model, "norm"):
             base.append("norm")
-
         return base
 
     def preprocess_input(self, raw_batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -93,10 +87,10 @@ class Dinov3VisionAdapter(ModelAdapter):
     def forward(self, batch: Dict[str, Any]) -> None:
         pixel_values = batch["pixel_values"]
         if torch.is_grad_enabled():
-            _ = self.model(pixel_values=pixel_values)
+            _ = self.model(pixel_values)
         else:
             with torch.no_grad():
-                _ = self.model(pixel_values=pixel_values)
+                _ = self.model(pixel_values)
 
     def get_provenance_spec(self) -> Dict[str, Any]:
         cols = ("sample_id", "y", "x")
@@ -112,8 +106,6 @@ def create_dinov3_store(
     on_batch_generated: Optional[Any] = None,
 ) -> UniversalActivationStore:
     adapter = Dinov3VisionAdapter(model, device=cfg.get("device"))
-    if collate_fn is not None:
-        adapter.collate_fn = collate_fn
     return UniversalActivationStore(
         model,
         cfg,

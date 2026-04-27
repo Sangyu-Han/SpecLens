@@ -1,0 +1,60 @@
+dataset:
+  builder: src.packs.siglip.dataset.builders:build_indexing_dataset
+  collate_builder: src.packs.siglip.dataset.builders:build_collate_fn
+  root: /data/datasets/imagenet
+  split: val
+  batch_size: 64
+  shuffle: false
+  drop_last: false
+  image_size: 224
+  interpolation: bicubic
+  mean: [0.5, 0.5, 0.5]
+  std: [0.5, 0.5, 0.5]
+
+model:
+  loader: src.packs.siglip.train.factories:load_model
+  name: vit_base_patch16_siglip_224
+  pretrained: true
+  dtype: float32
+
+sae:
+  factory: src.core.sae.registry:create_sae
+  layers:
+    - model.blocks.2
+    - model.blocks.6
+    - model.blocks.10
+  output:
+    save_path: /home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/siglip_50k_sae
+
+store_cfg:
+  factory: src.packs.siglip.models.adapters:create_siglip_store
+  provenance:
+    enabled: true
+  defaults:
+    batch_size: 4096
+    low: 4096
+    high: 65536
+    stride: 1
+
+offline_meta:
+  ledger_class: src.packs.clip.offline.offline_meta_parquet:OfflineMetaParquetLedger
+  part_modulus: 128
+
+indexing:
+  out_dir: /home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/siglip_50k_index
+  offline_meta_root: /home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/siglip_50k_index/offline_meta
+  checkpoint_dir: /home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/siglip_50k_index/.state
+  out_prefix: siglip_50k_vitb16
+  partition_modulus: 128
+  num_deciles: 10
+  top_k_per_decile: 10
+  random_k_per_feature: 5
+  collect_gate_k: 1
+  seed: 42
+  dedupe:
+    factory: src.packs.clip.indexing.dedupe:by_sample_id
+  l2_warn_threshold: 0.25
+
+logging:
+  level: INFO
+  log_dir: /home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/logs
