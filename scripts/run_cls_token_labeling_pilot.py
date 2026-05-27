@@ -324,6 +324,8 @@ def _render_feature_examples(
             actmap,
             sae_fire_path,
             token_idx=None,
+            image_size=int(runtime.config.image_size),
+            resize_size=int(runtime.config.resize_size),
             background_color=CLIP_ZERO_RGB,
         )
 
@@ -339,6 +341,8 @@ def _render_feature_examples(
             erf_path,
             token_idx=0,
             mode="masked_black",
+            image_size=int(runtime.config.image_size),
+            resize_size=int(runtime.config.resize_size),
             background_color=CLIP_ZERO_RGB,
             mask_resample=Image.NEAREST,
             include_token_box=False,
@@ -688,7 +692,7 @@ def main() -> None:
     parser.add_argument("--label-model", default="gpt-5.4")
     parser.add_argument("--label-reasoning-effort", default="xhigh")
     parser.add_argument("--jobs", type=int, default=4)
-    parser.add_argument("--erf-threshold", type=float, default=0.80)
+    parser.add_argument("--erf-threshold", type=float, default=0.90)
     parser.add_argument("--erf-support-min-attribution", type=float, default=0.10)
     parser.add_argument("--allow-shortfall", action="store_true")
     parser.add_argument("--max-scan-rows", type=int, default=128)
@@ -785,6 +789,9 @@ def main() -> None:
             "features_per_block": int(args.features_per_block),
             "top_k": int(args.top_k),
             "random_seed": int(args.random_seed),
+            "image_size": int(config.image_size),
+            "resize_size": int(config.resize_size),
+            "render_spatial_preprocess": "resize_shorter_edge_then_center_crop",
             "candidate_summary": candidate_summary,
             "features": selection,
         }

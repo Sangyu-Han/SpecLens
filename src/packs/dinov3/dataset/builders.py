@@ -28,6 +28,7 @@ def _build_transform(cfg: Dict[str, Any]) -> transforms.Compose:
     std = tuple(cfg.get("std", DEFAULT_STD))
     interpolation = _resolve_interpolation(cfg.get("interpolation", "bicubic"))
     is_train = bool(cfg.get("is_train", True))
+    resize_size = int(cfg.get("resize_size", int(image_size * 256 / 224)))
 
     if is_train:
         aug = [
@@ -36,7 +37,7 @@ def _build_transform(cfg: Dict[str, Any]) -> transforms.Compose:
         ]
     else:
         aug = [
-            transforms.Resize(int(image_size * 256 / 224), interpolation=interpolation, antialias=True),
+            transforms.Resize(resize_size, interpolation=interpolation, antialias=True),
             transforms.CenterCrop(image_size),
         ]
     aug.extend([transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)])

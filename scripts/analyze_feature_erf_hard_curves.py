@@ -65,7 +65,8 @@ def _compute_curve(state, scores: np.ndarray, budget_fracs: Sequence[float]) -> 
 
     block_out_orig = mm._run_injected(state.model, state.x, state.prefix_tokens, state.h_b0_patches, state.block_idx)
     act_orig = mm._sae_act(state.sae, block_out_orig, state.feature_id, state.tok_max, state.n_prefix, "single")
-    act_orig_safe = max(abs(act_orig), 1e-8)
+    block_out_base = mm._run_injected(state.model, state.x, state.prefix_tokens, state.baseline, state.block_idx)
+    act_base = mm._sae_act(state.sae, block_out_base, state.feature_id, state.tok_max, state.n_prefix, "single")
 
     h_cur = state.baseline.clone()
     current_k = 0
@@ -77,7 +78,7 @@ def _compute_curve(state, scores: np.ndarray, budget_fracs: Sequence[float]) -> 
             current_k += 1
         block_out = mm._run_injected(state.model, state.x, state.prefix_tokens, h_cur, state.block_idx)
         act_k = mm._sae_act(state.sae, block_out, state.feature_id, state.tok_max, state.n_prefix, "single")
-        vals.append(float(act_k / act_orig_safe))
+        vals.append(float(mm.baseline_corrected_recovery(act_k, act_orig, act_base)))
 
     return {
         "n_patches": n_patches,

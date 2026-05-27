@@ -908,23 +908,52 @@ def _render_autolabel_feature_pool_row(
         erf_heatmap_path = feature_dir / f"example_{rank:02d}_feature_erf_heatmap.png"
         erf_json_path = feature_dir / f"example_{rank:02d}_feature_erf.json"
 
-        save_original_with_token_box(image_path, original_path, token_idx)
+        save_original_with_token_box(
+            image_path,
+            original_path,
+            token_idx,
+            image_size=int(config.image_size),
+            grid_size=int(config.grid_size),
+            resize_size=int(config.resize_size),
+        )
         actmap = runtime.feature_activation_map(image_path, block_idx, feature_id)
-        save_feature_actmap_overlay(image_path, actmap, actmap_path, token_idx=token_idx)
+        save_feature_actmap_overlay(
+            image_path,
+            actmap,
+            actmap_path,
+            token_idx=token_idx,
+            image_size=int(config.image_size),
+            grid_size=int(config.grid_size),
+            resize_size=int(config.resize_size),
+        )
         erf = runtime.cautious_feature_erf(image_path, block_idx, token_idx, feature_id)
-        save_support_mask_image(image_path, erf["support_indices"], erf_support_path, token_idx=token_idx)
+        save_support_mask_image(
+            image_path,
+            erf["support_indices"],
+            erf_support_path,
+            token_idx=token_idx,
+            image_size=int(config.image_size),
+            grid_size=int(config.grid_size),
+            resize_size=int(config.resize_size),
+        )
         zoom_meta = save_support_outline_crop_image(
             image_path,
             erf["support_indices"],
             erf_zoom_path,
             token_idx=token_idx,
             score_map=erf["prob_scores"],
+            image_size=int(config.image_size),
+            grid_size=int(config.grid_size),
+            resize_size=int(config.resize_size),
         )
         save_support_detail_crop_image(
             image_path,
             erf["support_indices"],
             erf_zoom_detail_path,
             token_idx=token_idx,
+            image_size=int(config.image_size),
+            grid_size=int(config.grid_size),
+            resize_size=int(config.resize_size),
         )
         save_erf_heatmap_image(
             image_path,

@@ -321,7 +321,7 @@ def main() -> None:
     parser.add_argument("--left-session-dir", required=True)
     parser.add_argument("--right-session-dir", required=True)
     parser.add_argument("--left-label", default="Blind ERF-only")
-    parser.add_argument("--right-label", default="Blind SAE-only")
+    parser.add_argument("--right-label", default="Blind AL-based")
     parser.add_argument("--left-metric-id", default="blind_erf_only")
     parser.add_argument("--right-metric-id", default="blind_sae_only")
     parser.add_argument("--axis-summary", default="")

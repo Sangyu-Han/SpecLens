@@ -581,13 +581,45 @@ def _collect_feature_support_pack(
             actmap_path = out_dir / f"support_{rank:02d}_actmap.png"
             erf_zoom_path = out_dir / f"support_{rank:02d}_erf_zoom.png"
             erf_zoom_detail_path = out_dir / f"support_{rank:02d}_erf_zoom_detail.png"
-            save_original_with_token_box(image_path, original_path, token_idx)
+            save_original_with_token_box(
+                image_path,
+                original_path,
+                token_idx,
+                image_size=int(config.image_size),
+                grid_size=int(config.grid_size),
+                resize_size=int(config.resize_size),
+            )
             actmap = runtime.feature_activation_map(image_path, int(feature["block_idx"]), int(feature["feature_id"]))
-            save_feature_actmap_overlay(image_path, actmap, actmap_path, token_idx=token_idx)
+            save_feature_actmap_overlay(
+                image_path,
+                actmap,
+                actmap_path,
+                token_idx=token_idx,
+                image_size=int(config.image_size),
+                grid_size=int(config.grid_size),
+                resize_size=int(config.resize_size),
+            )
             erf = runtime.cautious_token_erf(image_path, int(feature["block_idx"]), token_idx)
-            save_support_outline_crop_image(image_path, erf["support_indices"], erf_zoom_path, token_idx=token_idx, score_map=erf["prob_scores"])
+            save_support_outline_crop_image(
+                image_path,
+                erf["support_indices"],
+                erf_zoom_path,
+                token_idx=token_idx,
+                score_map=erf["prob_scores"],
+                image_size=int(config.image_size),
+                grid_size=int(config.grid_size),
+                resize_size=int(config.resize_size),
+            )
             if include_erf_zoom_detail:
-                save_support_detail_crop_image(image_path, erf["support_indices"], erf_zoom_detail_path, token_idx=token_idx)
+                save_support_detail_crop_image(
+                    image_path,
+                    erf["support_indices"],
+                    erf_zoom_detail_path,
+                    token_idx=token_idx,
+                    image_size=int(config.image_size),
+                    grid_size=int(config.grid_size),
+                    resize_size=int(config.resize_size),
+                )
             rendered.append(
                 {
                     "sample_id": int(row["sample_id"]),

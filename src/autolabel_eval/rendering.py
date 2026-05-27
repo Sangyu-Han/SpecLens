@@ -13,8 +13,49 @@ CLIP_ZERO_RGB = (
 )
 
 
-def _resize_image(image: Image.Image, size: int = 224) -> Image.Image:
-    return image.resize((size, size), Image.BICUBIC)
+def _default_resize_size(image_size: int) -> int:
+    return int(float(image_size) * 256.0 / 224.0)
+
+
+def _resize_image(image: Image.Image, size: int = 224, resize_size: int | None = None) -> Image.Image:
+    """Match eval preprocessing spatial geometry before token-grid rendering."""
+    image_size = int(size)
+    pre_crop_size = int(resize_size) if resize_size is not None else _default_resize_size(image_size)
+    if image_size <= 0 or pre_crop_size <= 0:
+        raise ValueError(f"Invalid render geometry: image_size={image_size}, resize_size={pre_crop_size}")
+
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid image dimensions: {image.size}")
+
+    if width < height:
+        resized_w = pre_crop_size
+        resized_h = int(pre_crop_size * height / width)
+    elif height < width:
+        resized_h = pre_crop_size
+        resized_w = int(pre_crop_size * width / height)
+    else:
+        resized_w = pre_crop_size
+        resized_h = pre_crop_size
+    resized_w = max(resized_w, image_size)
+    resized_h = max(resized_h, image_size)
+
+    resized = image.resize((resized_w, resized_h), Image.BICUBIC)
+    left = max(0, (resized_w - image_size) // 2)
+    top = max(0, (resized_h - image_size) // 2)
+    return resized.crop((left, top, left + image_size, top + image_size))
+
+
+def save_model_input_image(
+    image_path: str,
+    out_path: Path,
+    *,
+    image_size: int = 224,
+    resize_size: int | None = None,
+) -> None:
+    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(out_path)
 
 
 def _patch_box(token_idx: int, grid_size: int = 14, image_size: int = 224) -> tuple[int, int, int, int]:
@@ -367,16 +408,19 @@ def save_original_with_token_box(
     out_path: Path,
     token_idx: int,
     *,
+    image_size: int = 224,
+    grid_size: int = 14,
+    resize_size: int | None = None,
     color: tuple[int, int, int] = (0, 255, 255),
     marker_style: str = "box",
 ) -> None:
-    image = _resize_image(Image.open(image_path).convert("RGB"))
+    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size)
     style = str(marker_style).strip().lower()
     if style == "cross":
-        _draw_patch_cross(image, token_idx, color=color, alpha=210, width=3)
+        _draw_patch_cross(image, token_idx, grid_size=grid_size, image_size=image_size, color=color, alpha=210, width=3)
     else:
         draw = ImageDraw.Draw(image)
-        draw.rectangle(_patch_box(token_idx), outline=color, width=3)
+        draw.rectangle(_patch_box(token_idx, grid_size=grid_size, image_size=image_size), outline=color, width=3)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     image.save(out_path)
 
@@ -388,8 +432,9 @@ def save_activation_region_image(
     *,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
 ) -> None:
-    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size)
+    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size)
     acts = np.asarray(activation_map, dtype=np.float32).reshape(grid_size, grid_size)
     mask_small = (acts < 1e-5).astype(np.uint8) * 224
     mask = Image.fromarray(mask_small, mode="L").resize((image_size, image_size), Image.NEAREST)
@@ -407,12 +452,13 @@ def save_feature_actmap_masked_image(
     token_idx: int | None = None,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
     activation_threshold: float = 0.24,
     include_token_box: bool = False,
     box_color: tuple[int, int, int] = (0, 255, 255),
     background_color: tuple[int, int, int] = (0, 0, 0),
 ) -> dict[str, Any]:
-    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size)
+    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size)
     values = np.asarray(activation_map, dtype=np.float32).reshape(grid_size, grid_size)
     scaled = _normalize_positive_values(values, lower_percentile=58.0, upper_percentile=99.5, gamma=0.9)
     mask_grid = (scaled >= float(activation_threshold)).astype(np.uint8)
@@ -452,8 +498,15 @@ def save_feature_actmap_overlay(
     token_idx: int,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
 ) -> None:
-    image = np.asarray(_resize_image(Image.open(image_path).convert("RGB"), size=image_size), dtype=np.float32) / 255.0
+    image = (
+        np.asarray(
+            _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size),
+            dtype=np.float32,
+        )
+        / 255.0
+    )
     values = np.asarray(activation_map, dtype=np.float32).reshape(grid_size, grid_size)
     scaled = _normalize_positive_values(values, lower_percentile=58.0, upper_percentile=99.5, gamma=0.9)
     focus = np.clip((scaled - 0.10) / 0.90, 0.0, 1.0)
@@ -480,12 +533,16 @@ def save_sae_fire_on_original(
     token_idx: int,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
     lower_percentile: float = 58.0,
     upper_percentile: float = 99.5,
     gamma: float = 0.9,
     threshold: float = 0.10,
 ) -> None:
-    image = np.asarray(_resize_image(Image.open(image_path).convert("RGB"), size=image_size), dtype=np.float32)
+    image = np.asarray(
+        _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size),
+        dtype=np.float32,
+    )
     values = np.asarray(activation_map, dtype=np.float32).reshape(grid_size, grid_size)
     scaled = _normalize_positive_values(values, lower_percentile=lower_percentile, upper_percentile=upper_percentile, gamma=gamma)
     focus = np.clip((scaled - threshold) / max(1e-6, 1.0 - threshold), 0.0, 1.0)
@@ -510,6 +567,7 @@ def save_support_mask_image(
     token_idx: int,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
     dim_factor: float = 0.15,
     mode: str = "dimmed",
     background_color: tuple[int, int, int] = (0, 0, 0),
@@ -519,7 +577,10 @@ def save_support_mask_image(
     token_marker_color: tuple[int, int, int] = (40, 220, 80),
     token_marker_alpha: int = 168,
 ) -> Image.Image:
-    image = np.asarray(_resize_image(Image.open(image_path).convert("RGB"), size=image_size), dtype=np.float32)
+    image = np.asarray(
+        _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size),
+        dtype=np.float32,
+    )
     support = np.zeros((grid_size, grid_size), dtype=np.float32)
     for index in support_indices:
         row, col = divmod(int(index), grid_size)
@@ -638,6 +699,7 @@ def save_support_locator_grid_image(
     token_idx: int,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
     dim_factor: float = 0.15,
     background_color: tuple[int, int, int] = (0, 0, 0),
     mask_resample: int = Image.NEAREST,
@@ -651,6 +713,7 @@ def save_support_locator_grid_image(
         token_idx=token_idx,
         image_size=image_size,
         grid_size=grid_size,
+        resize_size=resize_size,
         dim_factor=dim_factor,
         mode="masked_black",
         background_color=background_color,
@@ -680,6 +743,7 @@ def save_support_overview_zoom_image(
     token_idx: int,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
     dim_factor: float = 0.15,
     background_color: tuple[int, int, int] = (0, 0, 0),
     mask_resample: int = Image.NEAREST,
@@ -695,6 +759,7 @@ def save_support_overview_zoom_image(
         token_idx=token_idx,
         image_size=image_size,
         grid_size=grid_size,
+        resize_size=resize_size,
         dim_factor=dim_factor,
         mode="masked_black",
         background_color=background_color,
@@ -735,6 +800,7 @@ def save_support_outline_crop_image(
     score_map: Sequence[float] | None = None,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
     margin_patches: int = 0,
     min_crop_patches: int = 4,
     max_recommended_area_ratio: float = 0.70,
@@ -777,7 +843,7 @@ def save_support_outline_crop_image(
         crop_h_patches < grid_size or crop_w_patches < grid_size
     )
 
-    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size)
+    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size)
     patch = image_size // grid_size
     crop_box = (
         col_start * patch,
@@ -924,6 +990,7 @@ def save_support_detail_crop_image(
     token_idx: int | None = None,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
     margin_patches: int = 0,
     min_crop_patches: int = 4,
     background_gray: int = 18,
@@ -952,7 +1019,7 @@ def save_support_detail_crop_image(
         limit=grid_size,
     )
 
-    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size)
+    image = _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size)
     patch = image_size // grid_size
     crop_box = (
         col_start * patch,
@@ -1060,8 +1127,15 @@ def save_cosine_overlay_image(
     token_idx: int,
     image_size: int = 224,
     grid_size: int = 14,
+    resize_size: int | None = None,
 ) -> None:
-    image = np.asarray(_resize_image(Image.open(image_path).convert("RGB"), size=image_size), dtype=np.float32) / 255.0
+    image = (
+        np.asarray(
+            _resize_image(Image.open(image_path).convert("RGB"), size=image_size, resize_size=resize_size),
+            dtype=np.float32,
+        )
+        / 255.0
+    )
     values = np.asarray(cosine_map, dtype=np.float32).reshape(grid_size, grid_size)
     if values.size == 0:
         raise ValueError("Empty cosine map")

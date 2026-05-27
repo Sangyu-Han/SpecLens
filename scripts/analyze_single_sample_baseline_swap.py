@@ -155,7 +155,8 @@ def _hard_curve(state, scores: np.ndarray, budget_fracs: Sequence[float]) -> Dic
     budgets = sorted({max(0, min(n_patches, int(round(float(frac) * n_patches)))) for frac in budget_fracs})
     block_out_orig = mm._run_injected(state.model, state.x, state.prefix_tokens, state.h_b0_patches, state.block_idx)
     act_orig = mm._sae_act(state.sae, block_out_orig, state.feature_id, state.tok_max, state.n_prefix, "single")
-    act_orig_safe = max(abs(act_orig), 1e-8)
+    block_out_base = mm._run_injected(state.model, state.x, state.prefix_tokens, state.baseline, state.block_idx)
+    act_base = mm._sae_act(state.sae, block_out_base, state.feature_id, state.tok_max, state.n_prefix, "single")
 
     h_cur = state.baseline.clone()
     vals: List[float] = []
@@ -167,7 +168,7 @@ def _hard_curve(state, scores: np.ndarray, budget_fracs: Sequence[float]) -> Dic
             current_k += 1
         block_out = mm._run_injected(state.model, state.x, state.prefix_tokens, h_cur, state.block_idx)
         act_k = mm._sae_act(state.sae, block_out, state.feature_id, state.tok_max, state.n_prefix, "single")
-        vals.append(float(act_k / act_orig_safe))
+        vals.append(float(mm.baseline_corrected_recovery(act_k, act_orig, act_base)))
     return {
         "budgets": budgets,
         "budget_fracs": [float(k / n_patches) for k in budgets],
@@ -182,7 +183,8 @@ def _hard_deletion_curve(state, scores: np.ndarray, budget_fracs: Sequence[float
     budgets = sorted({max(0, min(n_patches, int(round(float(frac) * n_patches)))) for frac in budget_fracs})
     block_out_orig = mm._run_injected(state.model, state.x, state.prefix_tokens, state.h_b0_patches, state.block_idx)
     act_orig = mm._sae_act(state.sae, block_out_orig, state.feature_id, state.tok_max, state.n_prefix, "single")
-    act_orig_safe = max(abs(act_orig), 1e-8)
+    block_out_base = mm._run_injected(state.model, state.x, state.prefix_tokens, state.baseline, state.block_idx)
+    act_base = mm._sae_act(state.sae, block_out_base, state.feature_id, state.tok_max, state.n_prefix, "single")
 
     h_cur = state.h_b0_patches.clone()
     vals: List[float] = []
@@ -194,7 +196,7 @@ def _hard_deletion_curve(state, scores: np.ndarray, budget_fracs: Sequence[float
             current_k += 1
         block_out = mm._run_injected(state.model, state.x, state.prefix_tokens, h_cur, state.block_idx)
         act_k = mm._sae_act(state.sae, block_out, state.feature_id, state.tok_max, state.n_prefix, "single")
-        vals.append(float(act_k / act_orig_safe))
+        vals.append(float(mm.baseline_corrected_recovery(act_k, act_orig, act_base)))
     fracs = [float(k / n_patches) for k in budgets]
     auc = float(np.trapz(np.asarray(vals, dtype=np.float64), np.asarray(fracs, dtype=np.float64)))
     return {

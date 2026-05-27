@@ -226,6 +226,19 @@ def compute_inflow_rollout(
     biases_1: List[torch.Tensor],
     biases_2: List[torch.Tensor],
 ) -> torch.Tensor:
+    """InFlow-style rollout through attention and residual paths.
+
+    Provenance: adapted from Walker et al., "Explaining ViTs Using
+    Information Flow" (AISTATS 2025), official implementation:
+    https://github.com/chasewalker26/InFlow-ViT-Explanation
+
+    This mirrors the paper/code's `compute_InFlow` structure: construct
+    per-block transition matrices from attention, add norm-weighted first
+    residual paths, add norm-weighted MLP/second-residual scaling, normalize,
+    and multiply matrices across blocks. In SpecLens this is used as the
+    `inflow_erf` baseline and is adapted from class/CLS attribution to
+    feature-conditioned ERF attribution for arbitrary target tokens.
+    """
     attn_s = torch.stack(attentions)
     bias1_s = torch.stack(biases_1)
     bias2_s = torch.stack(biases_2)

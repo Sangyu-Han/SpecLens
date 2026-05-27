@@ -119,7 +119,10 @@ def main() -> None:
                 state,
                 bench.mm._run_injected(state.model, state.x, state.prefix_tokens, state.h_b0_patches, state.block_idx),
             )
-            full = max(abs(full), 1e-8)
+            baseline_obj = bench._feature_response(
+                state,
+                bench.mm._run_injected(state.model, state.x, state.prefix_tokens, state.baseline, state.block_idx),
+            )
             vals = []
             for frac in budgets:
                 k = max(1, min(n_patches, int(round(frac * n_patches))))
@@ -127,7 +130,8 @@ def main() -> None:
                 h_cur = state.baseline.clone()
                 h_cur[0, idx] = state.h_b0_patches[0, idx]
                 block = bench.mm._run_injected(state.model, state.x, state.prefix_tokens, h_cur, state.block_idx)
-                vals.append(float(bench._feature_response(state, block) / full))
+                obj = bench._feature_response(state, block)
+                vals.append(float(bench.mm.baseline_corrected_recovery(obj, full, baseline_obj)))
             return vals
 
         metrics = bench._evaluate_scores(state, cautious, stoch_steps=20, stoch_samples=5, stoch_seeds=[0, 1, 2])

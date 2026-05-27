@@ -93,6 +93,14 @@ def _build_config_from_args(args: Any) -> EvalConfig:
         overrides["checkpoint_relpath_template"] = str(args.checkpoint_pattern)
     if getattr(args, "dataset_root", None):
         overrides["dataset_root_override"] = Path(args.dataset_root)
+    if getattr(args, "image_size", None):
+        overrides["image_size"] = int(args.image_size)
+    if getattr(args, "resize_size", None):
+        overrides["resize_size"] = int(args.resize_size)
+    if getattr(args, "grid_size", None):
+        overrides["grid_size"] = int(args.grid_size)
+    if getattr(args, "n_patches", None):
+        overrides["n_patches"] = int(args.n_patches)
     if getattr(args, "erf_threshold", None) is not None:
         overrides["erf_recovery_threshold"] = float(args.erf_threshold)
     if overrides:
@@ -213,6 +221,9 @@ def _ensure_original_token_box(
     block_idx: int,
     sample_id: int,
     token_idx: int,
+    image_size: int,
+    grid_size: int,
+    resize_size: int,
     token_cache: dict[str, dict[str, str]],
 ) -> dict[str, str]:
     uid = token_uid(block_idx, sample_id, token_idx)
@@ -222,7 +233,15 @@ def _ensure_original_token_box(
     token_dir = session_dir / "record_assets" / _slug(uid)
     token_dir.mkdir(parents=True, exist_ok=True)
     original_path = token_dir / "original_token_box.png"
-    save_original_with_token_box(image_path, original_path, token_idx, marker_style="cross")
+    save_original_with_token_box(
+        image_path,
+        original_path,
+        token_idx,
+        image_size=image_size,
+        grid_size=grid_size,
+        resize_size=resize_size,
+        marker_style="cross",
+    )
     payload = {
         "token_uid": uid,
         "original_with_token_box": str(original_path),
@@ -309,6 +328,7 @@ def _run_codex_eval(
         model=model,
         reasoning_effort=reasoning_effort,
         temp_prefix="supp_eval_",
+        strict_trace_check=False,
     )
     return (
         int(result["returncode"]),
@@ -515,6 +535,10 @@ def main() -> None:
     parser.add_argument("--checkpoints-root", default="")
     parser.add_argument("--checkpoint-pattern", default="")
     parser.add_argument("--dataset-root", default="")
+    parser.add_argument("--image-size", type=int, default=0)
+    parser.add_argument("--resize-size", type=int, default=0)
+    parser.add_argument("--grid-size", type=int, default=0)
+    parser.add_argument("--n-patches", type=int, default=0)
     parser.add_argument("--erf-threshold", type=float, default=0.90)
     args = parser.parse_args()
 
@@ -637,6 +661,9 @@ def main() -> None:
                     block_idx=block_idx,
                     sample_id=sample_id,
                     token_idx=target_idx,
+                    image_size=int(config.image_size),
+                    grid_size=int(config.grid_size),
+                    resize_size=int(config.resize_size),
                     token_cache=token_cache,
                 )
                 positive_raw = float((holdout_row.get("validation") or {}).get("act_at_target", holdout_row.get("ledger_score", 0.0)))
@@ -655,6 +682,9 @@ def main() -> None:
                     block_idx=block_idx,
                     sample_id=sample_id,
                     token_idx=int(same_image_neg_idx),
+                    image_size=int(config.image_size),
+                    grid_size=int(config.grid_size),
+                    resize_size=int(config.resize_size),
                     token_cache=token_cache,
                 )
                 same_image_raw = float(actmap[int(same_image_neg_idx)])
@@ -684,6 +714,9 @@ def main() -> None:
                         block_idx=block_idx,
                         sample_id=conf_sample_id,
                         token_idx=conf_token_idx,
+                        image_size=int(config.image_size),
+                        grid_size=int(config.grid_size),
+                        resize_size=int(config.resize_size),
                         token_cache=token_cache,
                     )
                     confuser_records.append(

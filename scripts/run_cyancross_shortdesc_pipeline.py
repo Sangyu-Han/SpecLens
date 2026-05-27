@@ -133,22 +133,37 @@ def _run_command(
 
 
 def _config_cli_args(args: argparse.Namespace) -> list[str]:
-    return [
+    out = [
         "--workspace-root",
         str(Path(args.workspace_root).resolve()),
         "--vision-model-name",
         str(args.vision_model_name),
         "--deciles-root",
         str(args.deciles_root),
-        "--checkpoints-root",
-        str(args.checkpoints_root),
-        "--checkpoint-pattern",
-        str(args.checkpoint_pattern),
-        "--dataset-root",
-        str(args.dataset_root),
-        "--erf-threshold",
-        str(float(args.erf_threshold)),
     ]
+    if str(args.offline_meta_root).strip():
+        out.extend(["--offline-meta-root", str(args.offline_meta_root)])
+    out.extend(
+        [
+            "--checkpoints-root",
+            str(args.checkpoints_root),
+            "--checkpoint-pattern",
+            str(args.checkpoint_pattern),
+            "--dataset-root",
+            str(args.dataset_root),
+            "--image-size",
+            str(int(args.image_size)),
+            "--resize-size",
+            str(int(args.resize_size)),
+            "--grid-size",
+            str(int(args.grid_size)),
+            "--n-patches",
+            str(int(args.n_patches)),
+            "--erf-threshold",
+            str(float(args.erf_threshold)),
+        ]
+    )
+    return out
 
 
 def main() -> None:
@@ -165,6 +180,7 @@ def main() -> None:
         "--deciles-root",
         default="/home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/clip_50k_index/deciles",
     )
+    parser.add_argument("--offline-meta-root", default="")
     parser.add_argument(
         "--checkpoints-root",
         default="/home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/clip_50k_sae",
@@ -174,8 +190,17 @@ def main() -> None:
         default="model.blocks.{block_idx}/step_0050000_tokens_204800000.pt",
     )
     parser.add_argument("--dataset-root", default="/data/datasets/imagenet/val")
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--resize-size", type=int, default=256)
+    parser.add_argument("--grid-size", type=int, default=14)
+    parser.add_argument("--n-patches", type=int, default=196)
     parser.add_argument("--erf-threshold", type=float, default=0.90)
     parser.add_argument("--erf-support-min-attribution", type=float, default=0.10)
+    parser.add_argument(
+        "--erf-attribution-method",
+        choices=("cautious_cos", "input_x_grad"),
+        default="cautious_cos",
+    )
     parser.add_argument("--label-model", default="gpt-5.4")
     parser.add_argument("--label-reasoning-effort", default="xhigh")
     parser.add_argument("--label-prompt-style", default="label_shortdesc_where_v1")
@@ -251,17 +276,32 @@ def main() -> None:
         str(args.vision_model_name),
         "--deciles-root",
         str(args.deciles_root),
+    ]
+    if str(args.offline_meta_root).strip():
+        source_cmd.extend(["--offline-meta-root", str(args.offline_meta_root)])
+    source_cmd.extend(
+        [
         "--checkpoints-root",
         str(args.checkpoints_root),
         "--checkpoint-pattern",
         str(args.checkpoint_pattern),
         "--dataset-root",
         str(args.dataset_root),
+        "--image-size",
+        str(int(args.image_size)),
+        "--resize-size",
+        str(int(args.resize_size)),
+        "--grid-size",
+        str(int(args.grid_size)),
+        "--n-patches",
+        str(int(args.n_patches)),
         "--erf-threshold",
         str(float(args.erf_threshold)),
         "--erf-support-min-attribution",
         str(float(args.erf_support_min_attribution)),
-    ]
+        "--erf-attribution-method",
+        str(args.erf_attribution_method),
+    ])
     for key in feature_keys:
         source_cmd.extend(["--feature-key", key])
     source_complete = (source_dir / "selection_manifest.json").exists()
@@ -326,7 +366,7 @@ def main() -> None:
     ]
     sae_complete = (sae_dir / "raw_predictions.json").exists() and (sae_dir / "selection_manifest.json").exists()
     if not sae_complete:
-        _run_command(sae_label_cmd, cwd=ROOT, label="label SAE-only panels", command_log=command_log)
+        _run_command(sae_label_cmd, cwd=ROOT, label="label AL-based panels", command_log=command_log)
 
     compare_dir = pipeline_root / "compare_html"
     compare_html_name = "erf_vs_sae_shortdesc_compare.html"
@@ -342,13 +382,13 @@ def main() -> None:
             "--left-label",
             "ERF cyan cross shortdesc",
             "--right-label",
-            "SAE-only shortdesc",
+            "AL-based shortdesc",
             "--left-metric-id",
             "erf_cyan_cross",
             "--right-metric-id",
             "sae_only",
             "--title",
-            "ERF cyan cross vs SAE-only shortdesc",
+            "ERF cyan cross vs AL-based shortdesc",
             "--out-dir",
             str(compare_dir),
             "--out-name",
@@ -384,6 +424,8 @@ def main() -> None:
                 str(int(args.jobs_axis)),
                 "--axis2-candidate-count",
                 str(int(args.axis2_candidate_count)),
+                "--feature-manifest-json",
+                str(args.feature_manifest_json),
                 "--variant",
                 f"erf_cyan_cross={erf_session}",
                 "--variant",
@@ -392,15 +434,29 @@ def main() -> None:
                 str(args.vision_model_name),
                 "--deciles-root",
                 str(args.deciles_root),
-                "--checkpoints-root",
-                str(args.checkpoints_root),
-                "--checkpoint-pattern",
-                str(args.checkpoint_pattern),
-                "--dataset-root",
-                str(args.dataset_root),
-                "--erf-threshold",
-                str(float(args.erf_threshold)),
             ]
+            if str(args.offline_meta_root).strip():
+                axis_cmd.extend(["--offline-meta-root", str(args.offline_meta_root)])
+            axis_cmd.extend(
+                [
+                    "--checkpoints-root",
+                    str(args.checkpoints_root),
+                    "--checkpoint-pattern",
+                    str(args.checkpoint_pattern),
+                    "--dataset-root",
+                    str(args.dataset_root),
+                    "--image-size",
+                    str(int(args.image_size)),
+                    "--resize-size",
+                    str(int(args.resize_size)),
+                    "--grid-size",
+                    str(int(args.grid_size)),
+                    "--n-patches",
+                    str(int(args.n_patches)),
+                    "--erf-threshold",
+                    str(float(args.erf_threshold)),
+                ]
+            )
             _run_command(axis_cmd, cwd=ROOT, label="run axis pilot", command_log=command_log)
             axis_summary_path = axis_dir / "summary.json"
 
@@ -429,15 +485,29 @@ def main() -> None:
                 str(args.vision_model_name),
                 "--deciles-root",
                 str(args.deciles_root),
-                "--checkpoints-root",
-                str(args.checkpoints_root),
-                "--checkpoint-pattern",
-                str(args.checkpoint_pattern),
-                "--dataset-root",
-                str(args.dataset_root),
-                "--erf-threshold",
-                str(float(args.erf_threshold)),
             ]
+            if str(args.offline_meta_root).strip():
+                supp_cmd.extend(["--offline-meta-root", str(args.offline_meta_root)])
+            supp_cmd.extend(
+                [
+                    "--checkpoints-root",
+                    str(args.checkpoints_root),
+                    "--checkpoint-pattern",
+                    str(args.checkpoint_pattern),
+                    "--dataset-root",
+                    str(args.dataset_root),
+                    "--image-size",
+                    str(int(args.image_size)),
+                    "--resize-size",
+                    str(int(args.resize_size)),
+                    "--grid-size",
+                    str(int(args.grid_size)),
+                    "--n-patches",
+                    str(int(args.n_patches)),
+                    "--erf-threshold",
+                    str(float(args.erf_threshold)),
+                ]
+            )
             _run_command(supp_cmd, cwd=ROOT, label="run supplementary pilot", command_log=command_log)
             supp_summary_path = supp_dir / "summary.json"
 
@@ -482,11 +552,17 @@ def main() -> None:
             "axis2_candidate_count": int(args.axis2_candidate_count),
             "vision_model_name": str(args.vision_model_name),
             "deciles_root": str(args.deciles_root),
+            "offline_meta_root": str(args.offline_meta_root),
             "checkpoints_root": str(args.checkpoints_root),
             "checkpoint_pattern": str(args.checkpoint_pattern),
             "dataset_root": str(args.dataset_root),
+            "image_size": int(args.image_size),
+            "resize_size": int(args.resize_size),
+            "grid_size": int(args.grid_size),
+            "n_patches": int(args.n_patches),
             "erf_threshold": float(args.erf_threshold),
             "erf_support_min_attribution": float(args.erf_support_min_attribution),
+            "erf_attribution_method": str(args.erf_attribution_method),
         },
         "commands": command_log,
     }

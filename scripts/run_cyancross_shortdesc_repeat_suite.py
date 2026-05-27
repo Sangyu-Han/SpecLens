@@ -104,10 +104,18 @@ def _build_config_from_args(args: argparse.Namespace) -> EvalConfig:
         "features_per_block": int(args.master_features_per_block),
         "train_examples_per_feature": int(args.train_examples_per_feature),
         "holdout_examples_per_feature": int(args.holdout_examples_per_feature),
+        "min_mean_score": float(args.min_mean_score),
         "deciles_root_override": Path(args.deciles_root).resolve(),
+        "offline_meta_root_override": Path(args.offline_meta_root).resolve()
+        if str(args.offline_meta_root).strip()
+        else None,
         "checkpoints_root_override": Path(args.checkpoints_root).resolve(),
         "checkpoint_relpath_template": str(args.checkpoint_pattern),
         "dataset_root_override": Path(args.dataset_root).resolve(),
+        "image_size": int(args.image_size),
+        "resize_size": int(args.resize_size),
+        "grid_size": int(args.grid_size),
+        "n_patches": int(args.n_patches),
         "erf_recovery_threshold": float(args.erf_threshold),
         "shuffle_feature_candidates": True,
         "random_seed": int(args.selection_seed),
@@ -125,10 +133,16 @@ def _config_matches_feature_bank(payload: dict[str, Any], config: EvalConfig) ->
         "features_per_block": int(config.features_per_block),
         "train_examples_per_feature": int(config.train_examples_per_feature),
         "holdout_examples_per_feature": int(config.holdout_examples_per_feature),
+        "min_mean_score": float(config.min_mean_score),
         "deciles_root": str(config.deciles_root),
+        "offline_meta_root": str(config.offline_meta_root) if config.offline_meta_root is not None else None,
         "checkpoints_root": str(config.checkpoints_root),
         "checkpoint_relpath_template": str(config.checkpoint_relpath_template),
         "dataset_root_override": str(config.dataset_root_override) if config.dataset_root_override is not None else None,
+        "image_size": int(config.image_size),
+        "resize_size": int(config.resize_size),
+        "grid_size": int(config.grid_size),
+        "n_patches": int(config.n_patches),
         "shuffle_feature_candidates": True,
         "random_seed": int(config.random_seed),
     }
@@ -422,10 +436,17 @@ def _aggregate_supp(repeat_rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _build_suite_html(out_path: Path, payload: dict[str, Any]) -> None:
     repeat_rows = list(payload["repeats"])
+    supp_enabled = bool(payload.get("supp_enabled", True))
     repeat_cards = []
     for row in repeat_rows:
         axis = dict(row.get("axis_metrics") or {})
         supp = dict(row.get("supp_metrics") or {})
+        supp_cell = (
+            f"{_format_float(float(supp.get('supp_test_erf_rho', float('nan'))))} / "
+            f"{_format_float(float(supp.get('supp_test_sae_rho', float('nan'))))}"
+            if supp_enabled
+            else "skipped"
+        )
         repeat_cards.append(
             f"""
             <tr>
@@ -437,14 +458,30 @@ def _build_suite_html(out_path: Path, payload: dict[str, Any]) -> None:
               <td><a href="{html.escape(str(row['sae_review_html_rel']))}">SAE review</a></td>
               <td>{_format_float(float(axis.get('axis1_erf_top1', float('nan'))))} / {_format_float(float(axis.get('axis1_sae_top1', float('nan'))))}</td>
               <td>{_format_float(float(axis.get('axis2_erf_top1', float('nan'))))} / {_format_float(float(axis.get('axis2_sae_top1', float('nan'))))}</td>
-              <td>{_format_float(float(supp.get('supp_test_erf_rho', float('nan'))))} / {_format_float(float(supp.get('supp_test_sae_rho', float('nan'))))}</td>
+              <td>{supp_cell}</td>
             </tr>
             """
         )
 
     axis = dict(payload["aggregate"]["axis"])
-    supp = dict(payload["aggregate"]["supp"])
+    supp = dict(payload["aggregate"].get("supp") or {})
     consistency = dict(payload["consistency"])
+    supp_card = (
+        f"""
+      <section class="card">
+        <h3>Supp Test</h3>
+        <div class="meta">ERF rho / AUROC / AP = {_format_float(float(supp['supp_test']['erf_cyan_cross']['overall']['spearman_rho']))} / {_format_float(float(supp['supp_test']['erf_cyan_cross']['overall']['auroc']))} / {_format_float(float(supp['supp_test']['erf_cyan_cross']['overall']['average_precision']))}</div>
+        <div class="meta">SAE rho / AUROC / AP = {_format_float(float(supp['supp_test']['sae_only']['overall']['spearman_rho']))} / {_format_float(float(supp['supp_test']['sae_only']['overall']['auroc']))} / {_format_float(float(supp['supp_test']['sae_only']['overall']['average_precision']))}</div>
+      </section>
+        """
+        if supp_enabled
+        else """
+      <section class="card">
+        <h3>Supp Test</h3>
+        <div class="meta">Skipped for this axis-only suite.</div>
+      </section>
+        """
+    )
 
     html_text = f"""<!doctype html>
 <html lang="en">
@@ -482,11 +519,7 @@ def _build_suite_html(out_path: Path, payload: dict[str, Any]) -> None:
         <div class="meta">ERF top1 / MRR / R@5 = {_format_float(float(axis['axis2']['erf_cyan_cross']['overall']['top1_accuracy']))} / {_format_float(float(axis['axis2']['erf_cyan_cross']['overall']['mrr']))} / {_format_float(float(axis['axis2']['erf_cyan_cross']['overall']['Recall@5']))}</div>
         <div class="meta">SAE top1 / MRR / R@5 = {_format_float(float(axis['axis2']['sae_only']['overall']['top1_accuracy']))} / {_format_float(float(axis['axis2']['sae_only']['overall']['mrr']))} / {_format_float(float(axis['axis2']['sae_only']['overall']['Recall@5']))}</div>
       </section>
-      <section class="card">
-        <h3>Supp Test</h3>
-        <div class="meta">ERF rho / AUROC / AP = {_format_float(float(supp['supp_test']['erf_cyan_cross']['overall']['spearman_rho']))} / {_format_float(float(supp['supp_test']['erf_cyan_cross']['overall']['auroc']))} / {_format_float(float(supp['supp_test']['erf_cyan_cross']['overall']['average_precision']))}</div>
-        <div class="meta">SAE rho / AUROC / AP = {_format_float(float(supp['supp_test']['sae_only']['overall']['spearman_rho']))} / {_format_float(float(supp['supp_test']['sae_only']['overall']['auroc']))} / {_format_float(float(supp['supp_test']['sae_only']['overall']['average_precision']))}</div>
-      </section>
+      {supp_card}
     </div>
     <section class="table-wrap">
       <h2>Repeats</h2>
@@ -527,6 +560,7 @@ def main() -> None:
     parser.add_argument("--repeat-size-per-block", type=int, default=20)
     parser.add_argument("--train-examples-per-feature", type=int, default=5)
     parser.add_argument("--holdout-examples-per-feature", type=int, default=2)
+    parser.add_argument("--min-mean-score", type=float, default=5.0)
     parser.add_argument("--label-model", default="gpt-5.4")
     parser.add_argument("--label-reasoning-effort", default="xhigh")
     parser.add_argument("--label-prompt-style", default="label_shortdesc_where_v1")
@@ -535,12 +569,14 @@ def main() -> None:
     parser.add_argument("--judge-reasoning-effort", default="xhigh")
     parser.add_argument("--jobs-axis", type=int, default=4)
     parser.add_argument("--jobs-supp", type=int, default=4)
+    parser.add_argument("--skip-supp", action="store_true")
     parser.add_argument("--axis2-candidate-count", type=int, default=16)
     parser.add_argument("--vision-model-name", default="vit_base_patch16_clip_224.laion2b_ft_in12k_in1k")
     parser.add_argument(
         "--deciles-root",
         default="/home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/clip_50k_index/deciles",
     )
+    parser.add_argument("--offline-meta-root", default="")
     parser.add_argument(
         "--checkpoints-root",
         default="/home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/clip_50k_sae",
@@ -550,8 +586,17 @@ def main() -> None:
         default="model.blocks.{block_idx}/step_0050000_tokens_204800000.pt",
     )
     parser.add_argument("--dataset-root", default="/data/datasets/imagenet/val")
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--resize-size", type=int, default=256)
+    parser.add_argument("--grid-size", type=int, default=14)
+    parser.add_argument("--n-patches", type=int, default=196)
     parser.add_argument("--erf-threshold", type=float, default=0.90)
     parser.add_argument("--erf-support-min-attribution", type=float, default=0.10)
+    parser.add_argument(
+        "--erf-attribution-method",
+        choices=("cautious_cos", "input_x_grad"),
+        default="cautious_cos",
+    )
     parser.add_argument("--selection-seed", type=int, default=20260424)
     parser.add_argument("--rebuild-feature-bank", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -603,12 +648,22 @@ def main() -> None:
             str(args.vision_model_name),
             "--deciles-root",
             str(args.deciles_root),
+            "--offline-meta-root",
+            str(args.offline_meta_root),
             "--checkpoints-root",
             str(args.checkpoints_root),
             "--checkpoint-pattern",
             str(args.checkpoint_pattern),
             "--dataset-root",
             str(args.dataset_root),
+            "--image-size",
+            str(int(args.image_size)),
+            "--resize-size",
+            str(int(args.resize_size)),
+            "--grid-size",
+            str(int(args.grid_size)),
+            "--n-patches",
+            str(int(args.n_patches)),
             "--erf-threshold",
             str(float(args.erf_threshold)),
         ]
@@ -658,17 +713,31 @@ def main() -> None:
                 str(args.vision_model_name),
                 "--deciles-root",
                 str(args.deciles_root),
+                "--offline-meta-root",
+                str(args.offline_meta_root),
                 "--checkpoints-root",
                 str(args.checkpoints_root),
                 "--checkpoint-pattern",
                 str(args.checkpoint_pattern),
                 "--dataset-root",
                 str(args.dataset_root),
+                "--image-size",
+                str(int(args.image_size)),
+                "--resize-size",
+                str(int(args.resize_size)),
+                "--grid-size",
+                str(int(args.grid_size)),
+                "--n-patches",
+                str(int(args.n_patches)),
                 "--erf-threshold",
                 str(float(args.erf_threshold)),
                 "--erf-support-min-attribution",
                 str(float(args.erf_support_min_attribution)),
+                "--erf-attribution-method",
+                str(args.erf_attribution_method),
             ]
+            if bool(args.skip_supp):
+                pipeline_cmd.append("--skip-supp")
             if bool(args.resume):
                 pipeline_cmd.append("--resume")
             _run_command(
@@ -679,9 +748,15 @@ def main() -> None:
             )
         pipeline_manifest = _read_json(pipeline_manifest_path)
         axis_summary_json = str(pipeline_manifest["paths"]["axis_summary_json"])
-        supp_summary_json = str(pipeline_manifest["paths"]["supp_summary_json"])
         axis_summary = _read_json(Path(axis_summary_json))
-        supp_summary = _read_json(Path(supp_summary_json))
+        supp_summary_json = str(pipeline_manifest["paths"].get("supp_summary_json") or "")
+        supp_summary = _read_json(Path(supp_summary_json)) if supp_summary_json else None
+        supp_metrics = {}
+        if supp_summary is not None:
+            supp_metrics = {
+                "supp_test_erf_rho": float(supp_summary["supp_test"]["erf_cyan_cross"]["overall"]["spearman_rho"]),
+                "supp_test_sae_rho": float(supp_summary["supp_test"]["sae_only"]["overall"]["spearman_rho"]),
+            }
         repeat_rows.append(
             {
                 "repeat_index": int(repeat_index + 1),
@@ -698,16 +773,16 @@ def main() -> None:
                     "axis2_erf_top1": float(axis_summary["axis2"]["erf_cyan_cross"]["overall"]["top1_accuracy"]),
                     "axis2_sae_top1": float(axis_summary["axis2"]["sae_only"]["overall"]["top1_accuracy"]),
                 },
-                "supp_metrics": {
-                    "supp_test_erf_rho": float(supp_summary["supp_test"]["erf_cyan_cross"]["overall"]["spearman_rho"]),
-                    "supp_test_sae_rho": float(supp_summary["supp_test"]["sae_only"]["overall"]["spearman_rho"]),
-                },
+                "supp_metrics": supp_metrics,
             }
         )
 
     axis_aggregate = _aggregate_axis(repeat_rows)
-    supp_aggregate = _aggregate_supp(repeat_rows)
-    aggregate = {"axis": axis_aggregate, "supp": supp_aggregate}
+    aggregate = {"axis": axis_aggregate}
+    supp_aggregate = None
+    if not bool(args.skip_supp):
+        supp_aggregate = _aggregate_supp(repeat_rows)
+        aggregate["supp"] = supp_aggregate
 
     consistency_html_path = consistency_summary_path.parent / "index.html"
     suite_rows_with_rel: list[dict[str, Any]] = []
@@ -727,6 +802,8 @@ def main() -> None:
         "workspace_root": str(workspace_root),
         "repeat_count": int(args.repeat_count),
         "repeat_size_per_block": int(args.repeat_size_per_block),
+        "erf_attribution_method": str(args.erf_attribution_method),
+        "supp_enabled": not bool(args.skip_supp),
         "master_feature_count": int(len(master_manifest["selected_feature_keys"])),
         "master_manifest_json": str(master_manifest_path),
         "master_manifest_rel": os.path.relpath(str(master_manifest_path), str(suite_root)),
@@ -764,11 +841,16 @@ def main() -> None:
         "## Aggregate Axis 2",
         f"- ERF top1 / MRR / R@5: `{_format_float(float(axis_aggregate['axis2']['erf_cyan_cross']['overall']['top1_accuracy']))}` / `{_format_float(float(axis_aggregate['axis2']['erf_cyan_cross']['overall']['mrr']))}` / `{_format_float(float(axis_aggregate['axis2']['erf_cyan_cross']['overall']['Recall@5']))}`",
         f"- SAE top1 / MRR / R@5: `{_format_float(float(axis_aggregate['axis2']['sae_only']['overall']['top1_accuracy']))}` / `{_format_float(float(axis_aggregate['axis2']['sae_only']['overall']['mrr']))}` / `{_format_float(float(axis_aggregate['axis2']['sae_only']['overall']['Recall@5']))}`",
-        "",
-        "## Aggregate Supplementary Test",
-        f"- ERF rho / AUROC / AP / MAE: `{_format_float(float(supp_aggregate['supp_test']['erf_cyan_cross']['overall']['spearman_rho']))}` / `{_format_float(float(supp_aggregate['supp_test']['erf_cyan_cross']['overall']['auroc']))}` / `{_format_float(float(supp_aggregate['supp_test']['erf_cyan_cross']['overall']['average_precision']))}` / `{_format_float(float(supp_aggregate['supp_test']['erf_cyan_cross']['overall']['mae']))}`",
-        f"- SAE rho / AUROC / AP / MAE: `{_format_float(float(supp_aggregate['supp_test']['sae_only']['overall']['spearman_rho']))}` / `{_format_float(float(supp_aggregate['supp_test']['sae_only']['overall']['auroc']))}` / `{_format_float(float(supp_aggregate['supp_test']['sae_only']['overall']['average_precision']))}` / `{_format_float(float(supp_aggregate['supp_test']['sae_only']['overall']['mae']))}`",
     ]
+    if supp_aggregate is not None:
+        report_lines.extend(
+            [
+                "",
+                "## Aggregate Supplementary Test",
+                f"- ERF rho / AUROC / AP / MAE: `{_format_float(float(supp_aggregate['supp_test']['erf_cyan_cross']['overall']['spearman_rho']))}` / `{_format_float(float(supp_aggregate['supp_test']['erf_cyan_cross']['overall']['auroc']))}` / `{_format_float(float(supp_aggregate['supp_test']['erf_cyan_cross']['overall']['average_precision']))}` / `{_format_float(float(supp_aggregate['supp_test']['erf_cyan_cross']['overall']['mae']))}`",
+                f"- SAE rho / AUROC / AP / MAE: `{_format_float(float(supp_aggregate['supp_test']['sae_only']['overall']['spearman_rho']))}` / `{_format_float(float(supp_aggregate['supp_test']['sae_only']['overall']['auroc']))}` / `{_format_float(float(supp_aggregate['supp_test']['sae_only']['overall']['average_precision']))}` / `{_format_float(float(supp_aggregate['supp_test']['sae_only']['overall']['mae']))}`",
+            ]
+        )
     _write_text(suite_root / "report.md", "\n".join(report_lines) + "\n")
 
     _build_suite_html(suite_root / "index.html", payload)

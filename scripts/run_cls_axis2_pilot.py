@@ -23,12 +23,12 @@ if str(SRC) not in sys.path:
 
 import duckdb
 import numpy as np
-from PIL import Image
 
 from autolabel_eval.config import EvalConfig
 from autolabel_eval.isolated_codex import run_isolated_codex_exec
 from autolabel_eval.legacy import LegacyRuntime
 from autolabel_eval.metrics import ndcg_at_k, recall_at_k
+from autolabel_eval.rendering import save_model_input_image
 from autolabel_eval.utils import write_json
 
 
@@ -95,12 +95,6 @@ def _build_config_from_args(args: Any) -> EvalConfig:
 
 def _parquet_glob(config: EvalConfig, block_idx: int) -> str:
     return str((config.deciles_root / f"layer_part=model.blocks.{int(block_idx)}" / "**/*.parquet").as_posix())
-
-
-def _save_original_image(image_path: str, out_path: Path, *, size: int = 224) -> None:
-    image = Image.open(image_path).convert("RGB").resize((int(size), int(size)), Image.BICUBIC)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(out_path)
 
 
 def _load_variant_labels_from_cls_raw(raw_path: Path) -> dict[str, dict[str, dict[str, str]]]:
@@ -212,7 +206,7 @@ def _axis2_schema() -> dict[str, Any]:
             "ranked_candidates": {
                 "type": "array",
                 "items": {"type": "string", "maxLength": 8},
-                "maxItems": 32,
+                "maxItems": 128,
             },
             "confidence": {"type": "number"},
             "brief_reason": {"type": "string", "maxLength": 240},
@@ -254,11 +248,37 @@ def _build_review_html(out_path: Path, *, items: list[dict[str, Any]], results: 
     item_by_key = {(str(item["feature_key"]), int(item["sample_id"])): item for item in items}
     erf_rows = {(str(row["feature_key"]), int(row["sample_id"])): row for row in results["erf"]["per_item"]}
     sae_rows = {(str(row["feature_key"]), int(row["sample_id"])): row for row in results["sae"]["per_item"]}
+    labels_by_variant = results.get("labels_by_variant", {})
+
+    def label_text(variant: str, item: dict[str, Any], code: str) -> str:
+        code = str(code).lower()
+        feature_key = ""
+        for candidate in item["candidates"]:
+            if str(candidate["candidate_code"]).lower() == code:
+                feature_key = str(candidate["feature_key"])
+                break
+        label = dict(labels_by_variant.get(variant, {}).get(feature_key, {}))
+        canonical = _norm_text(label.get("canonical_label"))
+        if canonical:
+            return f"{feature_key}: {canonical}"
+        return feature_key or code
+
+    def rank_of(row: dict[str, Any], item: dict[str, Any]) -> int:
+        gold = str(item["gold_code"]).lower()
+        for idx, code in enumerate(row["ranked_candidates"], start=1):
+            if str(code).lower() == gold:
+                return int(idx)
+        return 0
+
     blocks: list[str] = []
     for item in items:
         key = (str(item["feature_key"]), int(item["sample_id"]))
         erf = erf_rows[key]
         sae = sae_rows[key]
+        gold_label_erf = label_text("erf", item, str(item["gold_code"]))
+        gold_label_sae = label_text("sae", item, str(item["gold_code"]))
+        erf_best = label_text("erf", item, str(erf["best_candidate"]))
+        sae_best = label_text("sae", item, str(sae["best_candidate"]))
         blocks.append(
             f"""
     <section class="feature">
@@ -268,14 +288,14 @@ def _build_review_html(out_path: Path, *, items: list[dict[str, Any]], results: 
       <div class="cards">
         <div class="card">
           <h3>ERF labels</h3>
-          <div><b>gold code</b>: {item['gold_code']}</div>
-          <div><b>best</b>: {erf['best_candidate']} ({'correct' if int(erf['top1_correct']) else 'wrong'})</div>
+          <div><b>gold</b>: {item['gold_code']} | {gold_label_erf}</div>
+          <div><b>best</b>: {erf['best_candidate']} | {erf_best} ({'correct' if int(erf['top1_correct']) else 'wrong'}, rank {rank_of(erf, item)})</div>
           <div><b>reason</b>: {erf['output'].get('brief_reason','')}</div>
         </div>
         <div class="card">
           <h3>SAE labels</h3>
-          <div><b>gold code</b>: {item['gold_code']}</div>
-          <div><b>best</b>: {sae['best_candidate']} ({'correct' if int(sae['top1_correct']) else 'wrong'})</div>
+          <div><b>gold</b>: {item['gold_code']} | {gold_label_sae}</div>
+          <div><b>best</b>: {sae['best_candidate']} | {sae_best} ({'correct' if int(sae['top1_correct']) else 'wrong'}, rank {rank_of(sae, item)})</div>
           <div><b>reason</b>: {sae['output'].get('brief_reason','')}</div>
         </div>
       </div>
@@ -384,7 +404,12 @@ def main() -> None:
                 }
             image_rel = f"heldout_assets/{_slug(feature_key)}__sample_{int(heldout['sample_id'])}.png"
             image_abs = session_dir / image_rel
-            _save_original_image(str(heldout["image_path"]), image_abs)
+            save_model_input_image(
+                str(heldout["image_path"]),
+                image_abs,
+                image_size=int(config.image_size),
+                resize_size=int(config.resize_size),
+            )
 
             candidates = [
                 {
@@ -421,6 +446,9 @@ def main() -> None:
             "session_name": str(args.session_name),
             "label_session_name": str(args.label_session_name),
             "n_items": len(axis2_items),
+            "image_size": int(config.image_size),
+            "resize_size": int(config.resize_size),
+            "render_spatial_preprocess": "resize_shorter_edge_then_center_crop",
             "axis2_items": axis2_items,
         },
     )
@@ -434,6 +462,18 @@ def main() -> None:
     def run_variant(variant_id: str) -> dict[str, Any]:
         variant_dir = results_root / variant_id
         variant_dir.mkdir(parents=True, exist_ok=True)
+        previous_rows: dict[tuple[str, int], dict[str, Any]] = {}
+        previous_results_path = variant_dir / "results.json"
+        if previous_results_path.exists():
+            try:
+                previous_payload = _read_json(previous_results_path)
+                previous_rows = {
+                    (str(row["feature_key"]), int(row["sample_id"])): dict(row)
+                    for row in list(previous_payload.get("per_item") or [])
+                    if int(row.get("returncode", 1)) == 0 and dict(row.get("output") or {})
+                }
+            except Exception:
+                previous_rows = {}
         tasks: list[dict[str, Any]] = []
         for item in axis2_items:
             candidates = []
@@ -458,18 +498,34 @@ def main() -> None:
             )
 
         def worker(task: dict[str, Any]) -> dict[str, Any]:
-            result = run_isolated_codex_exec(
-                artifact_dir=task["out_json"].parent,
-                artifact_stem=task["out_json"].stem,
-                prompt_text=task["prompt_text"],
-                schema=_read_json(axis2_schema_path),
-                images=[Path(task["image_path"])],
-                model=str(args.model),
-                reasoning_effort=str(args.reasoning_effort),
-                temp_prefix="cls_axis2_",
-            )
             item = task["item"]
-            output = dict(result["output"])
+            out_json = Path(task["out_json"])
+            previous = previous_rows.get((str(item["feature_key"]), int(item["sample_id"])))
+            if out_json.exists():
+                output = dict(_read_json(out_json))
+                elapsed_sec = float((previous or {}).get("elapsed_sec", 0.0) or 0.0)
+                returncode = 0
+                forbidden_trace_hits = []
+            elif previous is not None:
+                output = dict(previous["output"])
+                elapsed_sec = float(previous.get("elapsed_sec", 0.0) or 0.0)
+                returncode = int(previous.get("returncode", 0) or 0)
+                forbidden_trace_hits = list(previous.get("forbidden_trace_hits") or [])
+            else:
+                result = run_isolated_codex_exec(
+                    artifact_dir=task["out_json"].parent,
+                    artifact_stem=task["out_json"].stem,
+                    prompt_text=task["prompt_text"],
+                    schema=_read_json(axis2_schema_path),
+                    images=[Path(task["image_path"])],
+                    model=str(args.model),
+                    reasoning_effort=str(args.reasoning_effort),
+                    temp_prefix="cls_axis2_",
+                )
+                output = dict(result["output"])
+                elapsed_sec = float(result["elapsed_sec"])
+                returncode = int(result["returncode"])
+                forbidden_trace_hits = list(result.get("forbidden_trace_hits") or [])
             ranked = _normalize_ranking(
                 best_candidate=str(output.get("best_candidate", "")),
                 ranked_candidates=list(output.get("ranked_candidates") or []),
@@ -495,9 +551,9 @@ def main() -> None:
                 "recall_at_3": recall_at_k(y_true, y_score, 3),
                 "recall_at_5": recall_at_k(y_true, y_score, 5),
                 "confidence": float(output.get("confidence", 0.0) or 0.0),
-                "elapsed_sec": float(result["elapsed_sec"]),
-                "returncode": int(result["returncode"]),
-                "forbidden_trace_hits": list(result.get("forbidden_trace_hits") or []),
+                "elapsed_sec": elapsed_sec,
+                "returncode": returncode,
+                "forbidden_trace_hits": forbidden_trace_hits,
                 "output": output,
             }
 
@@ -548,6 +604,7 @@ def main() -> None:
 
     variant_order = ["erf", "sae"]
     results = {variant_id: run_variant(variant_id) for variant_id in variant_order}
+    results["labels_by_variant"] = variant_labels
 
     report_lines = [
         "# CLS Axis 2 Pilot",

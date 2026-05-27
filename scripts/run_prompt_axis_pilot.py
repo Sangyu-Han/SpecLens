@@ -71,6 +71,53 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text())
 
 
+def _normalize_token_rows(rows: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in list(rows or []):
+        payload = dict(row)
+        if "target_patch_idx" not in payload and "token_idx" in payload:
+            payload["target_patch_idx"] = int(payload["token_idx"])
+        out.append(payload)
+    return out
+
+
+def _normalize_feature_row(feature: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(feature)
+    if "train" not in payload:
+        payload["train"] = _normalize_token_rows(payload.get("label_examples"))
+    else:
+        payload["train"] = _normalize_token_rows(payload.get("train"))
+    if "holdout" not in payload:
+        payload["holdout"] = _normalize_token_rows(payload.get("holdout_examples"))
+    else:
+        payload["holdout"] = _normalize_token_rows(payload.get("holdout"))
+    return payload
+
+
+def _load_feature_lookup(config: EvalConfig, feature_manifest_json: str) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    feature_bank = load_feature_bank(config)
+    for block_payload in feature_bank["blocks"].values():
+        for feature in block_payload["features"]:
+            row = _normalize_feature_row(dict(feature))
+            lookup[str(row["feature_key"])] = row
+    if str(feature_manifest_json).strip():
+        manifest = _read_json(Path(feature_manifest_json))
+        for feature in list(manifest.get("features") or []):
+            row = _normalize_feature_row(dict(feature))
+            key = str(row["feature_key"])
+            existing = lookup.get(key)
+            if existing is not None:
+                merged = {**existing, **row}
+                if not row.get("train"):
+                    merged["train"] = list(existing.get("train") or [])
+                if not row.get("holdout"):
+                    merged["holdout"] = list(existing.get("holdout") or [])
+                row = merged
+            lookup[key] = row
+    return lookup
+
+
 def _build_config_from_args(args: Any) -> EvalConfig:
     config = EvalConfig()
     overrides: dict[str, Any] = {}
@@ -92,6 +139,14 @@ def _build_config_from_args(args: Any) -> EvalConfig:
         overrides["checkpoint_relpath_template"] = str(args.checkpoint_pattern)
     if getattr(args, "dataset_root", None):
         overrides["dataset_root_override"] = Path(args.dataset_root)
+    if getattr(args, "image_size", None):
+        overrides["image_size"] = int(args.image_size)
+    if getattr(args, "resize_size", None):
+        overrides["resize_size"] = int(args.resize_size)
+    if getattr(args, "grid_size", None):
+        overrides["grid_size"] = int(args.grid_size)
+    if getattr(args, "n_patches", None):
+        overrides["n_patches"] = int(args.n_patches)
     if getattr(args, "erf_threshold", None) is not None:
         overrides["erf_recovery_threshold"] = float(args.erf_threshold)
     if overrides:
@@ -243,6 +298,7 @@ def _run_codex_eval(
         model=model,
         reasoning_effort=reasoning_effort,
         temp_prefix="axis_eval_",
+        strict_trace_check=False,
     )
     return (
         int(result["returncode"]),
@@ -267,6 +323,9 @@ def _ensure_token_evidence(
     block_idx: int,
     sample_id: int,
     token_idx: int,
+    image_size: int,
+    grid_size: int,
+    resize_size: int,
     token_cache: dict[str, dict[str, str]],
 ) -> dict[str, str]:
     uid = token_uid(block_idx, sample_id, token_idx)
@@ -276,7 +335,15 @@ def _ensure_token_evidence(
     token_dir = session_dir / "token_assets" / _slug(uid)
     token_dir.mkdir(parents=True, exist_ok=True)
     original_path = token_dir / "original_token_box.png"
-    save_original_with_token_box(image_path, original_path, token_idx, marker_style="cross")
+    save_original_with_token_box(
+        image_path,
+        original_path,
+        token_idx,
+        image_size=image_size,
+        grid_size=grid_size,
+        resize_size=resize_size,
+        marker_style="cross",
+    )
     payload = {
         "token_uid": uid,
         "original_with_token_box": str(original_path),
@@ -355,6 +422,7 @@ def main() -> None:
     parser.add_argument("--axis1-negative-mode", choices=("hard", "random"), default="random")
     parser.add_argument("--skip-axis2", action="store_true")
     parser.add_argument("--variant", action="append", default=[])
+    parser.add_argument("--feature-manifest-json", default="")
     parser.add_argument("--variant-a-id", default="carrier_first")
     parser.add_argument("--variant-a-session", default="random20_gpt54_medium_carrierfirst_cyan_rerender_20260420")
     parser.add_argument("--variant-b-id", default="short_hardneg")
@@ -370,6 +438,10 @@ def main() -> None:
     parser.add_argument("--checkpoints-root", default="")
     parser.add_argument("--checkpoint-pattern", default="")
     parser.add_argument("--dataset-root", default="")
+    parser.add_argument("--image-size", type=int, default=0)
+    parser.add_argument("--resize-size", type=int, default=0)
+    parser.add_argument("--grid-size", type=int, default=0)
+    parser.add_argument("--n-patches", type=int, default=0)
     parser.add_argument("--erf-threshold", type=float, default=0.90)
     args = parser.parse_args()
     if int(args.axis2_candidate_count) < 2:
@@ -410,12 +482,7 @@ def main() -> None:
     if args.features_limit and int(args.features_limit) > 0:
         selected_feature_keys = selected_feature_keys[: int(args.features_limit)]
 
-    feature_bank = load_feature_bank(config)
-    feature_lookup = {
-        str(feature["feature_key"]): feature
-        for block_payload in feature_bank["blocks"].values()
-        for feature in block_payload["features"]
-    }
+    feature_lookup = _load_feature_lookup(config, str(args.feature_manifest_json))
     selected_features = [feature_lookup[key] for key in selected_feature_keys]
     selected_by_block: dict[int, list[dict[str, Any]]] = {}
     for block_idx in config.blocks:
@@ -485,6 +552,9 @@ def main() -> None:
                 block_idx=block_idx,
                 sample_id=sample_id,
                 token_idx=target_idx,
+                image_size=int(config.image_size),
+                grid_size=int(config.grid_size),
+                resize_size=int(config.resize_size),
                 token_cache=token_cache,
             )
             actmap = runtime.feature_activation_map(image_path, block_idx, feature_id)
@@ -513,6 +583,9 @@ def main() -> None:
                     block_idx=block_idx,
                     sample_id=sample_id,
                     token_idx=int(neg_idx),
+                    image_size=int(config.image_size),
+                    grid_size=int(config.grid_size),
+                    resize_size=int(config.resize_size),
                     token_cache=token_cache,
                 )
                 axis1_candidates.append(

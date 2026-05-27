@@ -457,7 +457,7 @@ Return JSON only:
     if prompt_key == "isolated_sae_stepdown_v1":
         if panel_key != "blind_sae_only_v1":
             raise KeyError(f"{prompt_style} only supports blind_sae_only_v1")
-        return """You are labeling exactly one visual SAE feature from one isolated SAE-only image set. The feature id carries no semantics. Use only the visible pixels in the five images. Gray hidden regions are unknown and provide no evidence. Each image shows only pixels in strongly firing SAE patches.
+        return """You are labeling exactly one visual SAE feature from one isolated AL-based image set. The feature id carries no semantics. Use only the visible pixels in the five images. Gray hidden regions are unknown and provide no evidence. Each image shows only pixels in strongly firing SAE patches.
 
 Task:
 Choose the strongest reusable visual concept directly supported across the five images.

@@ -213,6 +213,17 @@ except Exception:
                 module._saved_grad = None
 
     def compute_inflow_rollout(attentions, biases_1, biases_2):
+        """InFlow-style rollout baseline.
+
+        Source: Walker et al., "Explaining ViTs Using Information Flow"
+        (AISTATS 2025), official code:
+        https://github.com/chasewalker26/InFlow-ViT-Explanation
+
+        This is not Abnar-Zuidema attention flow/rollout. It follows the
+        InFlow transition-matrix construction with residual norm biases and
+        MLP residual scaling, then adapts the resulting token-token flow to
+        feature-conditioned ERF evaluation.
+        """
         attn_s = torch.stack(attentions)
         bias1_s = torch.stack(biases_1)
         bias2_s = torch.stack(biases_2)
@@ -479,6 +490,11 @@ def _run_libragrad_ig50_generic(state: mm.SAEState) -> np.ndarray:
 
 
 def _run_inflow_erf_generic(state: mm.SAEState) -> np.ndarray:
+    # `inflow_erf` is the feature-ERF adaptation of InFlow:
+    # Walker et al., "Explaining ViTs Using Information Flow", AISTATS 2025.
+    # The original method explains class decisions from the CLS token; here we
+    # reuse its information-flow rollout as a baseline for a target SAE feature
+    # and target token.
     payload = _collect_attention_payload(state, with_backward=True)
     num_heads = int(getattr(state.model.blocks[0].attn, "num_heads", 1))
     all_attentions: List[torch.Tensor] = []
@@ -635,7 +651,8 @@ def _stochastic_insertion_auc(
     probs = _soft_weights(scores, n_patches)
     full_block = mm._run_injected(state.model, state.x, state.prefix_tokens, state.h_b0_patches, state.block_idx)
     full_obj = _feature_response(state, full_block)
-    full_obj_safe = max(abs(full_obj), 1e-8)
+    baseline_block = mm._run_injected(state.model, state.x, state.prefix_tokens, state.baseline, state.block_idx)
+    baseline_obj = _feature_response(state, baseline_block)
     vals: List[float] = []
     generator = torch.Generator(device=state.x.device)
     generator.manual_seed(seed)
@@ -649,7 +666,8 @@ def _stochastic_insertion_auc(
             )
             h_mix = z * state.h_b0_patches + (1.0 - z) * state.baseline
             block_out = mm._run_injected(state.model, state.x, state.prefix_tokens, h_mix, state.block_idx)
-            step_vals.append(_feature_response(state, block_out) / full_obj_safe)
+            step_obj = _feature_response(state, block_out)
+            step_vals.append(mm.baseline_corrected_recovery(step_obj, full_obj, baseline_obj))
         vals.append(float(np.mean(step_vals)))
 
     return float(np.trapz(vals, np.linspace(0.0, 1.0, n_steps + 1)))
@@ -683,7 +701,8 @@ def _evaluate_scores(
     insertion_budgets = _insertion_budget_schedule(int(state.block_idx), n_patches)
     full_block = mm._run_injected(state.model, state.x, state.prefix_tokens, state.h_b0_patches, state.block_idx)
     full_obj = _feature_response(state, full_block)
-    full_obj_safe = max(abs(full_obj), 1e-8)
+    baseline_block = mm._run_injected(state.model, state.x, state.prefix_tokens, state.baseline, state.block_idx)
+    baseline_obj = _feature_response(state, baseline_block)
 
     scores = np.asarray(scores, dtype=np.float32).reshape(-1)
     scores_norm = mm.normalize_scores(scores)
@@ -765,7 +784,9 @@ def _evaluate_scores(
         "mas_ins_auc": float(mas["mas_ins_auc"]),
         "mas_response_auc": float(mas["mas_response_auc"]),
         "mas_penalty_auc": float(mas["mas_penalty_auc"]),
-        "full_objective": float(full_obj / full_obj_safe),
+        "full_objective": float(mm.baseline_corrected_recovery(full_obj, full_obj, baseline_obj)),
+        "baseline_objective": float(baseline_obj),
+        "full_raw_objective": float(full_obj),
         "insertion_budgets": insertion_budgets or list(range(0, n_patches + 1)),
         **idsds,
     }

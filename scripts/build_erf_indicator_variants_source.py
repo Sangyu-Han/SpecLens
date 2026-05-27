@@ -80,6 +80,37 @@ def html_escape(value: str) -> str:
     )
 
 
+def _infer_session_geometry(source_manifest: dict[str, Any], source_session_dir: Path) -> tuple[int, int, int]:
+    config = dict(source_manifest.get("config") or {})
+    image_size = int(config.get("image_size") or 0)
+    grid_size = int(config.get("grid_size") or 0)
+    resize_size = int(config.get("resize_size") or 0)
+    if image_size > 0 and grid_size > 0:
+        if resize_size <= 0:
+            resize_size = int(image_size * 256 / 224)
+        return image_size, grid_size, resize_size
+
+    session_hint = f"{source_manifest.get('session_name') or ''} {source_session_dir}".lower()
+    if "dinov3" in session_hint:
+        return 256, 16, int(256 * 256 / 224)
+    if "siglip" in session_hint or "clip" in session_hint:
+        return 224, 14, 256
+
+    max_idx = -1
+    for feature in list(source_manifest.get("features") or []):
+        for example in list(feature.get("label_examples") or []):
+            max_idx = max(max_idx, int(example.get("token_idx", -1)))
+    if max_idx < 0:
+        raise ValueError("Could not infer session geometry from source manifest")
+    n_patches = int(max_idx) + 1
+    grid_size = int(round(n_patches ** 0.5))
+    if grid_size * grid_size != n_patches:
+        raise ValueError(f"Could not infer square patch grid from max token idx {max_idx}")
+    image_size = int(grid_size * 16)
+    resize_size = int(image_size * 256 / 224)
+    return image_size, grid_size, resize_size
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-session-dir", required=True)
@@ -91,6 +122,7 @@ def main() -> None:
     out_session_dir.mkdir(parents=True, exist_ok=True)
 
     source_manifest = json.loads((source_session_dir / "selection_manifest.json").read_text())
+    image_size, grid_size, resize_size = _infer_session_geometry(source_manifest, source_session_dir)
     out_features: list[dict[str, Any]] = []
 
     for feature in source_manifest["features"]:
@@ -127,6 +159,9 @@ def main() -> None:
                 erf_payload["support_indices"],
                 plain_path,
                 token_idx=token_idx,
+                image_size=image_size,
+                grid_size=grid_size,
+                resize_size=resize_size,
                 mode="masked_black",
                 background_color=CLIP_ZERO_RGB,
                 include_token_box=False,
@@ -137,6 +172,9 @@ def main() -> None:
                 erf_payload["support_indices"],
                 locator_path,
                 token_idx=token_idx,
+                image_size=image_size,
+                grid_size=grid_size,
+                resize_size=resize_size,
                 background_color=CLIP_ZERO_RGB,
                 mask_resample=Image.NEAREST,
             )
@@ -145,6 +183,9 @@ def main() -> None:
                 erf_payload["support_indices"],
                 cyan_dot_path,
                 token_idx=token_idx,
+                image_size=image_size,
+                grid_size=grid_size,
+                resize_size=resize_size,
                 mode="masked_black",
                 background_color=CLIP_ZERO_RGB,
                 include_token_box=True,
@@ -158,6 +199,9 @@ def main() -> None:
                 erf_payload["support_indices"],
                 cyan_cross_path,
                 token_idx=token_idx,
+                image_size=image_size,
+                grid_size=grid_size,
+                resize_size=resize_size,
                 mode="masked_black",
                 background_color=CLIP_ZERO_RGB,
                 include_token_box=True,
@@ -171,6 +215,9 @@ def main() -> None:
                 erf_payload["support_indices"],
                 cyan_dashed_box_path,
                 token_idx=token_idx,
+                image_size=image_size,
+                grid_size=grid_size,
+                resize_size=resize_size,
                 mode="masked_black",
                 background_color=CLIP_ZERO_RGB,
                 include_token_box=True,
@@ -184,6 +231,9 @@ def main() -> None:
                 erf_payload["support_indices"],
                 box_path,
                 token_idx=token_idx,
+                image_size=image_size,
+                grid_size=grid_size,
+                resize_size=resize_size,
                 mode="masked_black",
                 background_color=CLIP_ZERO_RGB,
                 include_token_box=True,
@@ -196,6 +246,9 @@ def main() -> None:
                 erf_payload["support_indices"],
                 zoom_path,
                 token_idx=token_idx,
+                image_size=image_size,
+                grid_size=grid_size,
+                resize_size=resize_size,
                 background_color=CLIP_ZERO_RGB,
                 mask_resample=Image.NEAREST,
                 token_marker_color=(255, 64, 64),
@@ -230,6 +283,12 @@ def main() -> None:
         "session_name": out_session_dir.name,
         "source_session": str(source_manifest.get("session_name") or source_session_dir.name),
         "source_session_dir": str(source_session_dir),
+        "config": {
+            "image_size": int(image_size),
+            "resize_size": int(resize_size),
+            "grid_size": int(grid_size),
+            "render_spatial_preprocess": "resize_shorter_edge_then_center_crop",
+        },
         "variant_methods": [
             "feature_erf_plain",
             "feature_erf_locator_grid",

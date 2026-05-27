@@ -56,9 +56,16 @@ def _build_config_from_args(args: argparse.Namespace) -> EvalConfig:
         "train_examples_per_feature": int(args.train_examples_per_feature),
         "holdout_examples_per_feature": int(args.holdout_examples_per_feature),
         "deciles_root_override": Path(args.deciles_root).resolve(),
+        "offline_meta_root_override": Path(args.offline_meta_root).resolve()
+        if str(args.offline_meta_root).strip()
+        else None,
         "checkpoints_root_override": Path(args.checkpoints_root).resolve(),
         "checkpoint_relpath_template": str(args.checkpoint_pattern),
         "dataset_root_override": Path(args.dataset_root).resolve(),
+        "image_size": int(args.image_size),
+        "resize_size": int(args.resize_size),
+        "grid_size": int(args.grid_size),
+        "n_patches": int(args.n_patches),
         "erf_recovery_threshold": float(args.erf_threshold),
     }
     config = replace(EvalConfig(), **overrides)
@@ -238,6 +245,7 @@ def main() -> None:
         "--deciles-root",
         default="/home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/clip_50k_index/deciles",
     )
+    parser.add_argument("--offline-meta-root", default="")
     parser.add_argument(
         "--checkpoints-root",
         default="/home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/clip_50k_sae",
@@ -247,6 +255,10 @@ def main() -> None:
         default="model.blocks.{block_idx}/step_0050000_tokens_204800000.pt",
     )
     parser.add_argument("--dataset-root", default="/data/datasets/imagenet/val")
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--resize-size", type=int, default=256)
+    parser.add_argument("--grid-size", type=int, default=14)
+    parser.add_argument("--n-patches", type=int, default=196)
     parser.add_argument("--erf-threshold", type=float, default=0.90)
     args = parser.parse_args()
 

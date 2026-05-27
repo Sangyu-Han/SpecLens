@@ -157,11 +157,16 @@ class ForwardArtifacts:
     patch_out: torch.Tensor
 
 
-def ledger_row_x_to_token_idx(row_x: int, model_name: str) -> int:
+def ledger_row_x_to_token_idx(row_x: int, model_name: str, prefix_count: int | None = None) -> int:
     name = str(model_name).lower()
     # SigLIP deciles store patch-token x directly.
     if "siglip" in name:
         return int(row_x)
+    # DINOv3 deciles store full-sequence x. The first 5 tokens are prefix/register
+    # tokens, so patch tokens begin at x=5.
+    if "dinov3" in name:
+        prefix = 5 if prefix_count is None else int(prefix_count)
+        return int(row_x) - prefix
     # CLIP-style deciles store x with a +1 offset relative to patch tokens.
     return int(row_x) - 1
 
@@ -196,6 +201,22 @@ class LegacyRuntime:
             self.transform = build_siglip_transform(
                 {
                     "image_size": config.image_size,
+                    "resize_size": config.resize_size,
+                    "interpolation": "bicubic",
+                    "is_train": False,
+                }
+            )
+        elif "dinov3" in model_name_lower:
+            from src.packs.dinov3.attribution.erf_adapter import create_dinov3_erf_adapter
+            from src.packs.dinov3.dataset.builders import build_dinov3_transform
+            from src.packs.dinov3.models.model_loaders import load_dinov3_model
+
+            self.model = load_dinov3_model({"name": model_name, "pretrained": True}, device=self.device)
+            self.adapter = create_dinov3_erf_adapter(self.model)
+            self.transform = build_dinov3_transform(
+                {
+                    "image_size": config.image_size,
+                    "resize_size": config.resize_size,
                     "interpolation": "bicubic",
                     "is_train": False,
                 }
@@ -210,6 +231,7 @@ class LegacyRuntime:
             self.transform = build_clip_transform(
                 {
                     "image_size": config.image_size,
+                    "resize_size": config.resize_size,
                     "mean": [0.48145466, 0.4578275, 0.40821073],
                     "std": [0.26862954, 0.26130258, 0.27577711],
                     "interpolation": "bicubic",
@@ -230,7 +252,10 @@ class LegacyRuntime:
         self._sae_cache: dict[int, torch.nn.Module] = {}
 
     def row_x_to_token_idx(self, row_x: int) -> int:
-        return ledger_row_x_to_token_idx(int(row_x), str(self.config.model_name))
+        prefix_count = None
+        if "dinov3" in str(self.config.model_name).lower():
+            prefix_count = int(self.adapter.prefix_count())
+        return ledger_row_x_to_token_idx(int(row_x), str(self.config.model_name), prefix_count=prefix_count)
 
     def load_sae(self, block_idx: int) -> torch.nn.Module:
         block_idx = int(block_idx)
@@ -449,11 +474,17 @@ class LegacyRuntime:
         token_idx: int,
         feature_id: int,
         full_activation: torch.Tensor,
+        baseline_activation: torch.Tensor,
     ) -> torch.Tensor:
         acts = sae(patch_out).get("feature_acts")
         masked_act = acts[0, int(token_idx), int(feature_id)]
-        recovery = masked_act / full_activation.clamp(min=1e-8)
-        return torch.minimum(recovery, torch.ones((), device=recovery.device, dtype=recovery.dtype))
+        denom = (full_activation - baseline_activation).clamp(min=1e-8)
+        recovery = (masked_act - baseline_activation) / denom
+        return torch.clamp(
+            recovery,
+            min=torch.zeros((), device=recovery.device, dtype=recovery.dtype),
+            max=torch.ones((), device=recovery.device, dtype=recovery.dtype),
+        )
 
     def _feature_activation_recovery_objective_full(
         self,
@@ -757,9 +788,16 @@ class LegacyRuntime:
         )
         dtype = capture.patch_tokens.dtype
         dev = capture.patch_tokens.device
+        with torch.no_grad():
+            do_forward_masked(torch.zeros(self.config.n_patches, device=dev, dtype=dtype))
+            baseline_block_out = get_block_out()
+            prefix = self.adapter.prefix_count()
+            baseline_patch_out = baseline_block_out[:, prefix:, :]
+            baseline_acts = sae(baseline_patch_out).get("feature_acts")
+            baseline_activation = baseline_acts[0, int(token_idx), int(feature_id)].detach()
         generator = torch.Generator(device=dev)
         generator.manual_seed(int(self.config.cautious_seed))
-        metric_name = "feature_activation_recovery"
+        metric_name = "feature_activation_delta_recovery"
 
         def objective_for_mask(mask: torch.Tensor) -> torch.Tensor:
             do_forward_masked(mask)
@@ -772,6 +810,7 @@ class LegacyRuntime:
                 token_idx=int(token_idx),
                 feature_id=int(feature_id),
                 full_activation=full_activation,
+                baseline_activation=baseline_activation,
             )
 
         with torch.no_grad():
@@ -869,6 +908,8 @@ class LegacyRuntime:
             "support_recovery": float(support_recovery),
             "full_objective": float(full_objective),
             "full_feature_activation": float(full_activation.detach().cpu()),
+            "baseline_feature_activation": float(baseline_activation.detach().cpu()),
+            "effective_feature_activation_delta": float((full_activation - baseline_activation).detach().cpu()),
             "recovery_trace": list(search_summary["recovery_trace"]),
             "recovery_search_mode": str(search_summary["recovery_search_mode"]),
             "recovery_coarse_budgets": list(search_summary["recovery_coarse_budgets"]),
@@ -879,6 +920,158 @@ class LegacyRuntime:
             "recovery_threshold_reached": bool(search_summary["recovery_threshold_reached"]),
             "recovery_max": float(search_summary["recovery_max"]),
         }
+
+    def input_x_grad_feature_erf(
+        self,
+        image_path: str,
+        block_idx: int,
+        token_idx: int,
+        feature_id: int,
+    ) -> dict[str, Any]:
+        artifacts = self.forward_block(image_path, block_idx)
+        capture = artifacts.capture
+        sae = self.load_sae(block_idx)
+        with torch.no_grad():
+            full_acts = sae(artifacts.patch_out).get("feature_acts")
+            full_activation = full_acts[0, int(token_idx), int(feature_id)].detach()
+
+        set_alpha, do_forward_alpha, get_h_alpha, get_block_out_alpha = self.adapter.make_alpha_forward(
+            artifacts.x,
+            capture,
+            block_idx=int(block_idx),
+        )
+        self.model.zero_grad(set_to_none=True)
+        sae.zero_grad(set_to_none=True)
+        set_alpha(1.0)
+        do_forward_alpha()
+        alpha_block_out = get_block_out_alpha()
+        prefix = self.adapter.prefix_count()
+        alpha_patch_out = alpha_block_out[:, prefix:, :]
+        alpha_acts = sae(alpha_patch_out).get("feature_acts")
+        raw_objective = alpha_acts[0, int(token_idx), int(feature_id)]
+        raw_objective.backward()
+        grad = get_h_alpha().grad
+        if grad is None:
+            raise RuntimeError("input_x_grad attribution failed: missing gradient at block-0 patch embedding")
+        content_diff = (capture.patch_tokens - capture.baseline).detach()
+        scores_tensor = (content_diff * grad.detach()).norm(dim=-1)[0]
+        scores = scores_tensor.detach().cpu().numpy().astype(np.float32)
+        scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        scores = np.maximum(scores, 0.0).astype(np.float32)
+
+        do_forward_masked, get_block_out = self.adapter.make_masked_forward(
+            artifacts.x,
+            capture,
+            block_idx=int(block_idx),
+        )
+        dtype = capture.patch_tokens.dtype
+        dev = capture.patch_tokens.device
+        with torch.no_grad():
+            do_forward_masked(torch.zeros(self.config.n_patches, device=dev, dtype=dtype))
+            baseline_block_out = get_block_out()
+            baseline_patch_out = baseline_block_out[:, prefix:, :]
+            baseline_acts = sae(baseline_patch_out).get("feature_acts")
+            baseline_activation = baseline_acts[0, int(token_idx), int(feature_id)].detach()
+
+        metric_name = "feature_activation_delta_recovery"
+
+        def objective_for_mask(mask: torch.Tensor) -> torch.Tensor:
+            do_forward_masked(mask)
+            block_out = get_block_out()
+            patch_out = block_out[:, prefix:, :]
+            return self._feature_activation_recovery_objective(
+                patch_out,
+                sae=sae,
+                token_idx=int(token_idx),
+                feature_id=int(feature_id),
+                full_activation=full_activation,
+                baseline_activation=baseline_activation,
+            )
+
+        with torch.no_grad():
+            full_objective = float(objective_for_mask(torch.ones(self.config.n_patches, device=dev, dtype=dtype)).item())
+
+        full_order = np.argsort(-scores, kind="mergesort")
+        scores_max = float(scores.max()) if scores.size > 0 else 0.0
+        normalized_attribution = (scores / scores_max).astype(np.float32) if scores_max > 0 else np.zeros_like(scores)
+        min_norm_attr = float(self.config.erf_support_min_normalized_attribution)
+        valid_mask = normalized_attribution >= min_norm_attr
+        valid_order = full_order[valid_mask[full_order]]
+        if valid_order.size == 0:
+            valid_order = full_order[:1]
+        max_valid = int(valid_order.size)
+        recovery_cache: dict[int, float] = {}
+
+        def evaluate_prefix(prefix_size: int) -> float:
+            prefix_size = int(prefix_size)
+            cached = recovery_cache.get(prefix_size)
+            if cached is not None:
+                return cached
+            hard_mask = torch.zeros(self.config.n_patches, device=dev, dtype=dtype)
+            hard_mask[torch.as_tensor(valid_order[:prefix_size], device=dev)] = 1.0
+            recovery = float(objective_for_mask(hard_mask).detach().cpu())
+            recovery_cache[prefix_size] = recovery
+            return recovery
+
+        search_summary = _search_minimal_support_prefix(
+            n_patches=max_valid,
+            threshold=float(self.config.erf_recovery_threshold),
+            metric_name=metric_name,
+            recovery_cache=recovery_cache,
+            evaluate_prefix=evaluate_prefix,
+        )
+        support, support_size, support_recovery = _resolve_support_indices(
+            valid_order=valid_order,
+            proposed_support_size=int(search_summary["support_size"]),
+            threshold_reached=bool(search_summary["recovery_threshold_reached"]),
+            evaluate_prefix=evaluate_prefix,
+        )
+        return {
+            "objective_mode": "feature_activation",
+            "objective_metric_name": metric_name,
+            "erf_attribution_method": "input_x_grad",
+            "feature_id": int(feature_id),
+            "prob_scores": scores.tolist(),
+            "normalized_attribution": normalized_attribution.tolist(),
+            "ranking": full_order.tolist(),
+            "valid_ranking": valid_order.tolist(),
+            "support_indices": support,
+            "support_size": int(support_size),
+            "support_threshold": float(self.config.erf_recovery_threshold),
+            "support_min_normalized_attribution": min_norm_attr,
+            "support_recovery": float(support_recovery),
+            "full_objective": float(full_objective),
+            "full_feature_activation": float(full_activation.detach().cpu()),
+            "baseline_feature_activation": float(baseline_activation.detach().cpu()),
+            "effective_feature_activation_delta": float((full_activation - baseline_activation).detach().cpu()),
+            "recovery_trace": list(search_summary["recovery_trace"]),
+            "recovery_search_mode": str(search_summary["recovery_search_mode"]),
+            "recovery_coarse_budgets": list(search_summary["recovery_coarse_budgets"]),
+            "recovery_dense_limit": int(search_summary["recovery_dense_limit"]),
+            "recovery_bracket_low": int(search_summary["recovery_bracket_low"]),
+            "recovery_bracket_high": int(search_summary["recovery_bracket_high"]),
+            "recovery_eval_count": int(search_summary["recovery_eval_count"]),
+            "recovery_threshold_reached": bool(search_summary["recovery_threshold_reached"]),
+            "recovery_max": float(search_summary["recovery_max"]),
+        }
+
+    def feature_erf(
+        self,
+        image_path: str,
+        block_idx: int,
+        token_idx: int,
+        feature_id: int,
+        *,
+        attribution_method: str = "cautious_cos",
+    ) -> dict[str, Any]:
+        method = str(attribution_method or "cautious_cos").strip().lower()
+        if method in {"cautious_cos", "fri"}:
+            payload = self.cautious_feature_erf(image_path, block_idx, token_idx, feature_id)
+            payload["erf_attribution_method"] = "cautious_cos"
+            return payload
+        if method in {"input_x_grad", "ixg", "plain_ixg"}:
+            return self.input_x_grad_feature_erf(image_path, block_idx, token_idx, feature_id)
+        raise ValueError(f"Unsupported ERF attribution method: {attribution_method!r}")
 
     def cautious_feature_erf_special_token(
         self,

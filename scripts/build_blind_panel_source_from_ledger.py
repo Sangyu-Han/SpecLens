@@ -78,9 +78,14 @@ def _build_config_from_args(args: argparse.Namespace) -> EvalConfig:
         workspace_root=Path(args.workspace_root),
         model_name=str(args.vision_model_name),
         deciles_root_override=Path(args.deciles_root),
+        offline_meta_root_override=Path(args.offline_meta_root) if str(args.offline_meta_root).strip() else None,
         checkpoints_root_override=Path(args.checkpoints_root),
         checkpoint_relpath_template=str(args.checkpoint_pattern),
         dataset_root_override=Path(args.dataset_root),
+        image_size=int(args.image_size),
+        resize_size=int(args.resize_size),
+        grid_size=int(args.grid_size),
+        n_patches=int(args.n_patches),
         erf_recovery_threshold=float(args.erf_threshold),
         erf_support_min_normalized_attribution=float(args.erf_support_min_attribution),
     )
@@ -157,6 +162,7 @@ def _render_feature(
     feature_id: int,
     top_rows: list[dict[str, Any]],
     selection_stats: dict[str, Any],
+    erf_attribution_method: str,
 ) -> dict[str, Any]:
     feature_key = _feature_key(block_idx, feature_id)
     feature_dir = session_dir / "assets" / _slug(feature_key)
@@ -176,14 +182,18 @@ def _render_feature(
             actmap,
             sae_fire_path,
             token_idx=token_idx,
+            image_size=int(runtime.config.image_size),
+            grid_size=int(runtime.config.grid_size),
+            resize_size=int(runtime.config.resize_size),
             background_color=CLIP_ZERO_RGB,
         )
 
-        erf_payload = runtime.cautious_feature_erf(
+        erf_payload = runtime.feature_erf(
             image_path,
             int(block_idx),
             token_idx,
             int(feature_id),
+            attribution_method=str(erf_attribution_method),
         )
         if not list(erf_payload.get("support_indices") or []) and not bool(
             erf_payload.get("recovery_threshold_reached", False)
@@ -198,6 +208,9 @@ def _render_feature(
             erf_payload["support_indices"],
             erf_path,
             token_idx=token_idx,
+            image_size=int(runtime.config.image_size),
+            grid_size=int(runtime.config.grid_size),
+            resize_size=int(runtime.config.resize_size),
             mode="masked_black",
             background_color=CLIP_ZERO_RGB,
             mask_resample=Image.NEAREST,
@@ -313,6 +326,7 @@ def main() -> None:
         "--deciles-root",
         default="/home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/clip_50k_index/deciles",
     )
+    parser.add_argument("--offline-meta-root", default="")
     parser.add_argument(
         "--checkpoints-root",
         default="/home/sangyu/Desktop/Master/SpecLens/outputs/spec_lens_store/clip_50k_sae",
@@ -322,8 +336,17 @@ def main() -> None:
         default="model.blocks.{block_idx}/step_0050000_tokens_204800000.pt",
     )
     parser.add_argument("--dataset-root", default="/data/datasets/imagenet/val")
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--resize-size", type=int, default=256)
+    parser.add_argument("--grid-size", type=int, default=14)
+    parser.add_argument("--n-patches", type=int, default=196)
     parser.add_argument("--erf-threshold", type=float, default=0.90)
     parser.add_argument("--erf-support-min-attribution", type=float, default=0.10)
+    parser.add_argument(
+        "--erf-attribution-method",
+        choices=("cautious_cos", "input_x_grad"),
+        default="cautious_cos",
+    )
     args = parser.parse_args()
 
     feature_keys = [str(v).strip() for v in list(args.feature_key) if str(v).strip()]
@@ -380,6 +403,7 @@ def main() -> None:
                     feature_id=feature_id,
                     top_rows=top_rows,
                     selection_stats=stats,
+                    erf_attribution_method=str(args.erf_attribution_method),
                 )
             )
             selection_rows.append(
@@ -400,6 +424,17 @@ def main() -> None:
         "session_name": str(args.session_name),
         "source": "decile_ledger_topk",
         "workspace_root": str(config.workspace_root),
+        "config": {
+            "model_name": str(config.model_name),
+            "image_size": int(config.image_size),
+            "resize_size": int(config.resize_size),
+            "grid_size": int(config.grid_size),
+            "n_patches": int(config.n_patches),
+            "render_spatial_preprocess": "resize_shorter_edge_then_center_crop",
+            "erf_recovery_threshold": float(config.erf_recovery_threshold),
+            "erf_support_min_normalized_attribution": float(config.erf_support_min_normalized_attribution),
+            "erf_attribution_method": str(args.erf_attribution_method),
+        },
         "selection": selection_rows,
         "requested_feature_count": int(len(feature_keys)),
         "rendered_feature_count": int(len(rendered_features)),
@@ -414,6 +449,7 @@ def main() -> None:
             "dataset_root": str(args.dataset_root),
             "erf_recovery_threshold": float(args.erf_threshold),
             "erf_support_min_normalized_attribution": float(args.erf_support_min_attribution),
+            "erf_attribution_method": str(args.erf_attribution_method),
         },
         "features": rendered_features,
     }

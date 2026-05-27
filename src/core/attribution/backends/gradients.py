@@ -860,11 +860,24 @@ def build_annealed_concrete_backend(
             ones = torch.ones(n_patches, device=dev)
             do_forward_masked(ones)
             act_orig_val = _prepare_objective(objective_getter()).scalar_value.detach()
+            zeros = torch.zeros(n_patches, device=dev)
+            do_forward_masked(zeros)
+            act_base_val = _prepare_objective(objective_getter()).scalar_value.detach()
             acts_orig = (
                 acts_orig_spatial.to(dev).detach()
                 if acts_orig_spatial is not None
                 else None
             )
+
+        def _recovery_loss(act_masked: torch.Tensor) -> torch.Tensor:
+            denom = act_orig_val - act_base_val
+            denom_safe = torch.where(
+                denom.abs() >= 1e-8,
+                denom,
+                torch.where(denom >= 0, torch.full_like(denom, 1e-8), torch.full_like(denom, -1e-8)),
+            )
+            recovery = (act_masked - act_base_val) / denom_safe
+            return 1.0 - recovery
 
         if init_log_alphas is not None:
             log_alphas = init_log_alphas.detach().to(dev).clone().requires_grad_(True)
@@ -928,7 +941,7 @@ def build_annealed_concrete_backend(
                 # At each step, sample a budget b ~ Uniform(0, N) and compute the
                 # soft-insertion weights w_i = clamp(p_i * b, 1) where p_i is the
                 # normalized probability mass derived from log_alphas.
-                # Loss = 1 - act(w) / act_orig  (no L0: budget sampling self-regularizes)
+                # Loss = 1 - baseline-corrected recovery.
                 # This is differentiable w.r.t. log_alphas through p → w → h_inj → act.
                 # No HC sampling needed here — skip the z computation entirely.
                 probs = torch.sigmoid(log_alphas)              # [n_patches]
@@ -942,7 +955,7 @@ def build_annealed_concrete_backend(
                 tv_penalty = tv_weight * _tv_loss(probs) if tv_weight > 0.0 else 0.0
                 do_forward_masked(w)
                 act_masked = _prepare_objective(objective_getter()).scalar_value
-                loss = (1.0 - act_masked / act_orig_val.clamp(min=1e-8)) + irr_penalty + tv_penalty
+                loss = _recovery_loss(act_masked) + irr_penalty + tv_penalty
 
             elif loss_mode == "soft_del_auc":
                 # Deletion-direction soft AUC optimization.
@@ -951,7 +964,7 @@ def build_annealed_concrete_backend(
                 # At each step, sample budget b_del ~ Uniform(0, N) and compute:
                 #   del_w_i = clamp(q_i * b_del, 1)  = how much each patch is removed
                 #   keep_w_i = 1 - del_w_i           = effective keep weight
-                # Loss = 1 - act(keep_w) / act_orig  (maintain activation despite deletion)
+                # Loss = 1 - baseline-corrected recovery.
                 # Gradient: for a critical patch i, removing it hurts → ∂loss/∂probs_i > 0
                 #   → optimizer increases probs_i → q_i decreases → patch is protected.
                 # For irrelevant patches: removing them doesn't hurt → probs_i stays low.
@@ -969,7 +982,7 @@ def build_annealed_concrete_backend(
                 tv_penalty = tv_weight * _tv_loss(probs) if tv_weight > 0.0 else 0.0
                 do_forward_masked(keep_w)
                 act_masked = _prepare_objective(objective_getter()).scalar_value
-                loss = (1.0 - act_masked / act_orig_val.clamp(min=1e-8)) + irr_penalty + tv_penalty
+                loss = _recovery_loss(act_masked) + irr_penalty + tv_penalty
 
             else:
                 u = torch.rand_like(log_alphas).clamp(eps, 1 - eps)
@@ -987,7 +1000,7 @@ def build_annealed_concrete_backend(
 
                 if loss_mode == "recovery":
                     act_masked = _prepare_objective(objective_getter()).scalar_value
-                    loss = (1.0 - act_masked / act_orig_val.clamp(min=1e-8)) + lam * l0 + irr_penalty + tv_penalty
+                    loss = _recovery_loss(act_masked) + lam * l0 + irr_penalty + tv_penalty
 
                 elif loss_mode == "pearson":
                     assert distribution_getter is not None and acts_orig is not None
@@ -998,7 +1011,7 @@ def build_annealed_concrete_backend(
                     assert distribution_getter is not None and acts_orig is not None
                     act_masked = _prepare_objective(objective_getter()).scalar_value
                     dist_masked = distribution_getter()
-                    recovery = 1.0 - act_masked / act_orig_val.clamp(min=1e-8)
+                    recovery = _recovery_loss(act_masked)
                     pearson  = _pearson_loss(dist_masked, acts_orig)
                     loss = recovery + pearson_weight * pearson + lam * l0 + irr_penalty + tv_penalty
 
