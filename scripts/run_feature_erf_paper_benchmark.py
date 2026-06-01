@@ -21,6 +21,7 @@ REPO = Path(os.environ.get("SPECLENS_REPO", str(Path(__file__).resolve().parents
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from src.core.attribution.fri import FRIConfig, inverse_grad_irrelevance, run_fri
 from src.core.attribution.backends.gradients import build_ig_backend, build_ixg_backend
 from src.packs.clip.models.attnlrp import (
     AttnLRPAttention,
@@ -333,6 +334,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cautious-restarts", type=int, default=1)
     parser.add_argument("--cautious-budget-samples", type=int, default=1)
     parser.add_argument("--cautious-select-best", action="store_true")
+    parser.add_argument(
+        "--fri-implementation",
+        choices=("legacy", "core", "compare"),
+        default="core",
+        help=(
+            "Implementation used for cautious_cos/FRI. 'legacy' preserves the old external "
+            "runner path; 'compare' runs legacy and core "
+            "and fails if attribution scores differ."
+        ),
+    )
     parser.add_argument(
         "--cautious-objective-mode",
         choices=("random_budget_softins", "fixed_budget_softins", "direct_recovery"),
@@ -811,7 +822,7 @@ def _run_method(
         return _run_attnlrp_ixg_generic(state)
     if method == "inflow_erf":
         return _run_inflow_erf_generic(state)
-    if method == "cautious_cos":
+    if method in {"cautious_cos", "fri"}:
         n_patches = int(state.h_b0_patches.shape[1])
         grid = int(round(math.sqrt(n_patches)))
         if grid * grid != n_patches:
@@ -819,30 +830,153 @@ def _run_method(
         init_scores = None
         if str(cautious_kwargs.get("init_mode", "uniform")) == "plain_ixg":
             init_scores = np.asarray(mm.run_plain_ixg(state), dtype=np.float32)
-        return np.asarray(
-            mm.run_cautious_cos(
-                state,
-                n_patches,
-                grid,
-                steps=int(cautious_steps),
-                lr=float(cautious_kwargs.get("lr", 0.45)),
-                lr_end=float(cautious_kwargs.get("lr_end", 0.01)),
-                tv_weight=float(cautious_kwargs.get("tv_weight", 0.01)),
-                irr_weight=float(cautious_kwargs.get("irr_weight", 0.05)),
-                init_prob=float(cautious_kwargs.get("init_prob", 0.5)),
-                init_scores=init_scores,
-                reg_warmup_frac=float(cautious_kwargs.get("reg_warmup_frac", 0.0)),
-                restarts=int(cautious_kwargs.get("restarts", 1)),
-                budget_samples=int(cautious_kwargs.get("budget_samples", 1)),
-                select_best=bool(cautious_kwargs.get("select_best", False)),
-                objective_mode=str(cautious_kwargs.get("objective_mode", "random_budget_softins")),
-                optimizer_mode=str(cautious_kwargs.get("optimizer_mode", "cautious_adam_cosine")),
-                fixed_budget_frac=float(cautious_kwargs.get("fixed_budget_frac", 0.10)),
-                seed=int(cautious_kwargs.get("seed", 0)),
-            ),
-            dtype=np.float32,
+        cfg = _fri_config_from_kwargs(
+            cautious_steps=cautious_steps,
+            cautious_kwargs=cautious_kwargs,
+            init_scores=init_scores,
         )
+        implementation = str(cautious_kwargs.get("implementation", "legacy"))
+        if implementation == "legacy":
+            return _run_legacy_cautious_cos(state, n_patches, grid, cfg)
+        if implementation == "core":
+            return _run_core_fri(state, n_patches, grid, cfg)
+        if implementation == "compare":
+            legacy_scores = _run_legacy_cautious_cos(state, n_patches, grid, cfg)
+            core_scores = _run_core_fri(state, n_patches, grid, cfg)
+            if not np.array_equal(legacy_scores, core_scores):
+                max_abs = float(np.max(np.abs(legacy_scores - core_scores)))
+                raise AssertionError(f"FRI core/legacy score mismatch: max_abs_diff={max_abs:.9g}")
+            return core_scores
+        raise ValueError(f"Unknown FRI implementation: {implementation!r}")
     raise KeyError(f"Unknown method: {method}")
+
+
+def _fri_config_from_kwargs(
+    *,
+    cautious_steps: int,
+    cautious_kwargs: Dict[str, Any],
+    init_scores: np.ndarray | None,
+) -> FRIConfig:
+    return FRIConfig(
+        steps=int(cautious_steps),
+        lr=float(cautious_kwargs.get("lr", 0.45)),
+        lr_end=float(cautious_kwargs.get("lr_end", 0.01)),
+        tv_weight=float(cautious_kwargs.get("tv_weight", 0.01)),
+        irrelevance_weight=float(cautious_kwargs.get("irr_weight", 0.05)),
+        init_prob=float(cautious_kwargs.get("init_prob", 0.5)),
+        init_scores=init_scores,
+        reg_warmup_frac=float(cautious_kwargs.get("reg_warmup_frac", 0.0)),
+        restarts=int(cautious_kwargs.get("restarts", 1)),
+        budget_samples=int(cautious_kwargs.get("budget_samples", 1)),
+        select_best=bool(cautious_kwargs.get("select_best", False)),
+        objective_mode=str(cautious_kwargs.get("objective_mode", "random_budget_softins")),
+        optimizer_mode=str(cautious_kwargs.get("optimizer_mode", "cautious_adam_cosine")),
+        fixed_budget_frac=float(cautious_kwargs.get("fixed_budget_frac", 0.10)),
+        seed=int(cautious_kwargs.get("seed", 0)),
+    )
+
+
+def _run_legacy_cautious_cos(
+    state: mm.SAEState,
+    n_patches: int,
+    grid: int,
+    cfg: FRIConfig,
+) -> np.ndarray:
+    return np.asarray(
+        mm.run_cautious_cos(
+            state,
+            n_patches,
+            grid,
+            steps=int(cfg.steps),
+            lr=float(cfg.lr),
+            lr_end=float(cfg.lr_end),
+            tv_weight=float(cfg.tv_weight),
+            irr_weight=float(cfg.irrelevance_weight),
+            init_prob=float(cfg.init_prob),
+            init_scores=cfg.init_scores,
+            reg_warmup_frac=float(cfg.reg_warmup_frac),
+            restarts=int(cfg.restarts),
+            budget_samples=int(cfg.budget_samples),
+            select_best=bool(cfg.select_best),
+            objective_mode=str(cfg.objective_mode),
+            optimizer_mode=str(cfg.optimizer_mode),
+            fixed_budget_frac=float(cfg.fixed_budget_frac),
+            seed=int(cfg.seed),
+        ),
+        dtype=np.float32,
+    )
+
+
+def _run_core_fri(state: mm.SAEState, n_patches: int, grid: int, cfg: FRIConfig) -> np.ndarray:
+    dev = state.x.device
+    dtype = state.h_b0_patches.dtype
+    with torch.no_grad():
+        state.do_forward_masked(torch.ones(n_patches, device=dev, dtype=dtype))
+        full_objective = state.objective_getter_single().detach()
+        state.do_forward_masked(torch.zeros(n_patches, device=dev, dtype=dtype))
+        baseline_objective = state.objective_getter_single().detach()
+
+    def objective_for_mask(mask: torch.Tensor) -> torch.Tensor:
+        state.do_forward_masked(mask)
+        return state.objective_getter_single()
+
+    def objective_from_patches(h_var: torch.Tensor) -> torch.Tensor:
+        state.model.zero_grad(set_to_none=True)
+        state.sae.zero_grad(set_to_none=True)
+        h_inj = [torch.cat([state.prefix_tokens, h_var], dim=1)]
+        buf: List[torch.Tensor] = []
+        h_pre = state.model.blocks[0].register_forward_pre_hook(lambda _m, _args: (h_inj[0],))
+        h_blk = state.model.blocks[state.block_idx].register_forward_hook(
+            lambda _m, _i, o: buf.append(o if torch.is_tensor(o) else o[0])
+        )
+        try:
+            state.model(state.x)
+        finally:
+            h_pre.remove()
+            h_blk.remove()
+        h = buf[0][0, state.n_prefix :, :]
+        result = state.sae(h)
+        acts = result["feature_acts"] if isinstance(result, dict) else result
+        return acts[state.tok_max, state.feature_id]
+
+    irr = inverse_grad_irrelevance(
+        input_patches=state.h_b0_patches,
+        objective_from_patches=objective_from_patches,
+    )
+
+    def score_evaluator(scores: np.ndarray) -> float:
+        return float(
+            mm.soft_insertion_auc_n(
+                state.model,
+                state.sae,
+                state.x,
+                state.h_b0_patches,
+                state.prefix_tokens,
+                state.baseline,
+                state.feature_id,
+                state.tok_max,
+                state.block_idx,
+                scores,
+                n_patches,
+                state.n_prefix,
+                n_steps=8,
+                mode="single",
+            )
+        )
+
+    result = run_fri(
+        n_patches=n_patches,
+        grid_size=grid,
+        objective_for_mask=objective_for_mask,
+        full_objective=full_objective,
+        baseline_objective=baseline_objective,
+        irrelevance=irr,
+        config=cfg,
+        score_evaluator=score_evaluator,
+        device=dev,
+        dtype=dtype,
+    )
+    return np.asarray(result.scores, dtype=np.float32)
 
 
 def evaluate_triple(
@@ -953,6 +1087,7 @@ def _make_run_meta(pack_specs: Dict[str, Dict[str, Any]], args: argparse.Namespa
         "cautious_objective_mode": str(args.cautious_objective_mode),
         "cautious_optimizer_mode": str(args.cautious_optimizer_mode),
         "cautious_fixed_budget_frac": float(args.cautious_fixed_budget_frac),
+        "fri_implementation": str(args.fri_implementation),
         "baseline_mode": str(args.baseline_mode),
     }
     payload["fingerprint"] = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -1152,6 +1287,7 @@ def main() -> None:
                         "objective_mode": str(args.cautious_objective_mode),
                         "optimizer_mode": str(args.cautious_optimizer_mode),
                         "fixed_budget_frac": float(args.cautious_fixed_budget_frac),
+                        "implementation": str(args.fri_implementation),
                         "seed": int(args.seed),
                     },
                     strict_restore=bool(args.strict_restore),

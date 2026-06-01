@@ -196,6 +196,49 @@ attribution = runtime.compute(
 )
 ```
 
+### Feature Relevance via Soft Insertion (FRI)
+
+FRI optimizes a soft insertion mask over input patches to find the regions that recover a target
+feature activation. The reusable implementation lives in `src.core.attribution.fri`:
+
+```python
+from src.core.attribution.fri import FRIConfig, run_fri
+
+result = run_fri(
+    n_patches=196,
+    grid_size=14,
+    objective_for_mask=objective_for_mask,   # mask -> scalar feature objective
+    full_objective=full_objective,           # objective with all patches inserted
+    baseline_objective=baseline_objective,   # objective with no patches inserted
+    irrelevance=irrelevance,                 # inverse-gradient irrelevance penalty
+    config=FRIConfig(
+        steps=32,
+        lr=0.45,
+        lr_end=0.01,
+        tv_weight=0.01,
+        irrelevance_weight=0.05,
+    ),
+)
+scores = result.scores
+```
+
+The old benchmark name `cautious_cos` is kept as a compatibility alias for FRI. New benchmark
+runs use the core FRI implementation by default:
+
+```bash
+python scripts/run_feature_erf_paper_benchmark.py \
+    --pack clip --blocks 6 --methods fri \
+    --n-features 1 --n-images 1
+```
+
+To verify the new core implementation against the preserved legacy implementation:
+
+```bash
+python scripts/compare_fri_core_legacy.py \
+    --pack clip --blocks 6 \
+    --n-features 1 --n-images 1
+```
+
 #### Spec-Based Target Selection
 
 The same Spec system used for training hooks also selects attribution targets:

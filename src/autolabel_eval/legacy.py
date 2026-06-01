@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -12,6 +11,8 @@ import pyarrow.dataset as ds
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+from src.core.attribution.fri import FRIConfig, run_fri
 
 from .bootstrap import bootstrap_speclens, register_research_saes
 from .config import EvalConfig
@@ -650,8 +651,6 @@ class LegacyRuntime:
         target_vec = artifacts.patch_out[0, int(token_idx), :].detach()
         dtype = capture.patch_tokens.dtype
         dev = capture.patch_tokens.device
-        generator = torch.Generator(device=dev)
-        generator.manual_seed(int(self.config.cautious_seed))
 
         def objective_for_mask(mask: torch.Tensor) -> torch.Tensor:
             do_forward_masked(mask)
@@ -672,43 +671,26 @@ class LegacyRuntime:
             token_idx,
             objective_mode=objective_mode,
         ).to(device=dev, dtype=dtype)
-        logit_init = math.log(self.config.cautious_init_prob / (1.0 - self.config.cautious_init_prob))
-        log_alphas = torch.full((self.config.n_patches,), logit_init, device=dev, dtype=dtype)
-        m = torch.zeros_like(log_alphas)
-        v = torch.zeros_like(log_alphas)
-        beta1, beta2, eps = 0.9, 0.999, 1e-8
-
-        def tv_loss(values: torch.Tensor) -> torch.Tensor:
-            grid = values.view(self.config.grid_size, self.config.grid_size)
-            return (grid[:, :-1] - grid[:, 1:]).abs().sum() + (grid[:-1, :] - grid[1:, :]).abs().sum()
-
-        for step in range(int(self.config.cautious_steps)):
-            frac = step / max(int(self.config.cautious_steps) - 1, 1)
-            cur_lr = float(self.config.cautious_lr_end) + 0.5 * (
-                float(self.config.cautious_lr) - float(self.config.cautious_lr_end)
-            ) * (1.0 + math.cos(math.pi * frac))
-            budget = float(torch.rand(1, generator=generator, device=dev).item() * self.config.n_patches)
-            la_req = log_alphas.clone().requires_grad_(True)
-            probs = torch.sigmoid(la_req)
-            mass = probs / (probs.sum() + 1e-8)
-            soft_mask = (mass * budget).clamp(max=1.0)
-            objective = objective_for_mask(soft_mask)
-            loss = (1.0 - objective) + float(self.config.cautious_irr_weight) * (probs * irr).sum()
-            loss = loss + float(self.config.cautious_tv_weight) * tv_loss(probs)
-            loss.backward()
-            grad = la_req.grad.detach()
-            timestep = step + 1
-            m = beta1 * m + (1.0 - beta1) * grad
-            v = beta2 * v + (1.0 - beta2) * grad * grad
-            m_hat = m / (1.0 - beta1**timestep)
-            v_hat = v / (1.0 - beta2**timestep)
-            adam_dir = m_hat / (v_hat.sqrt() + eps)
-            mask = (adam_dir * grad > 0).to(dtype=dtype)
-            active = mask.sum().clamp(min=1.0)
-            mask = mask * (self.config.n_patches / active)
-            log_alphas = log_alphas - cur_lr * adam_dir * mask
-
-        probs = torch.sigmoid(log_alphas).detach().cpu().numpy().astype(np.float32)
+        fri = run_fri(
+            n_patches=int(self.config.n_patches),
+            grid_size=int(self.config.grid_size),
+            objective_for_mask=objective_for_mask,
+            full_objective=torch.ones((), device=dev, dtype=dtype),
+            baseline_objective=torch.zeros((), device=dev, dtype=dtype),
+            irrelevance=irr,
+            config=FRIConfig(
+                steps=int(self.config.cautious_steps),
+                lr=float(self.config.cautious_lr),
+                lr_end=float(self.config.cautious_lr_end),
+                tv_weight=float(self.config.cautious_tv_weight),
+                irrelevance_weight=float(self.config.cautious_irr_weight),
+                init_prob=float(self.config.cautious_init_prob),
+                seed=int(self.config.cautious_seed),
+            ),
+            device=dev,
+            dtype=dtype,
+        )
+        probs = np.asarray(fri.scores, dtype=np.float32)
         full_order = np.argsort(-probs, kind="mergesort")
         probs_max = float(probs.max()) if probs.size > 0 else 0.0
         normalized_attribution = (probs / probs_max).astype(np.float32) if probs_max > 0 else np.zeros_like(probs)
@@ -795,8 +777,6 @@ class LegacyRuntime:
             baseline_patch_out = baseline_block_out[:, prefix:, :]
             baseline_acts = sae(baseline_patch_out).get("feature_acts")
             baseline_activation = baseline_acts[0, int(token_idx), int(feature_id)].detach()
-        generator = torch.Generator(device=dev)
-        generator.manual_seed(int(self.config.cautious_seed))
         metric_name = "feature_activation_delta_recovery"
 
         def objective_for_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -821,43 +801,26 @@ class LegacyRuntime:
             token_idx,
             feature_id,
         ).to(device=dev, dtype=dtype)
-        logit_init = math.log(self.config.cautious_init_prob / (1.0 - self.config.cautious_init_prob))
-        log_alphas = torch.full((self.config.n_patches,), logit_init, device=dev, dtype=dtype)
-        m = torch.zeros_like(log_alphas)
-        v = torch.zeros_like(log_alphas)
-        beta1, beta2, eps = 0.9, 0.999, 1e-8
-
-        def tv_loss(values: torch.Tensor) -> torch.Tensor:
-            grid = values.view(self.config.grid_size, self.config.grid_size)
-            return (grid[:, :-1] - grid[:, 1:]).abs().sum() + (grid[:-1, :] - grid[1:, :]).abs().sum()
-
-        for step in range(int(self.config.cautious_steps)):
-            frac = step / max(int(self.config.cautious_steps) - 1, 1)
-            cur_lr = float(self.config.cautious_lr_end) + 0.5 * (
-                float(self.config.cautious_lr) - float(self.config.cautious_lr_end)
-            ) * (1.0 + math.cos(math.pi * frac))
-            budget = float(torch.rand(1, generator=generator, device=dev).item() * self.config.n_patches)
-            la_req = log_alphas.clone().requires_grad_(True)
-            probs = torch.sigmoid(la_req)
-            mass = probs / (probs.sum() + 1e-8)
-            soft_mask = (mass * budget).clamp(max=1.0)
-            objective = objective_for_mask(soft_mask)
-            loss = (1.0 - objective) + float(self.config.cautious_irr_weight) * (probs * irr).sum()
-            loss = loss + float(self.config.cautious_tv_weight) * tv_loss(probs)
-            loss.backward()
-            grad = la_req.grad.detach()
-            timestep = step + 1
-            m = beta1 * m + (1.0 - beta1) * grad
-            v = beta2 * v + (1.0 - beta2) * grad * grad
-            m_hat = m / (1.0 - beta1**timestep)
-            v_hat = v / (1.0 - beta2**timestep)
-            adam_dir = m_hat / (v_hat.sqrt() + eps)
-            mask = (adam_dir * grad > 0).to(dtype=dtype)
-            active = mask.sum().clamp(min=1.0)
-            mask = mask * (self.config.n_patches / active)
-            log_alphas = log_alphas - cur_lr * adam_dir * mask
-
-        probs = torch.sigmoid(log_alphas).detach().cpu().numpy().astype(np.float32)
+        fri = run_fri(
+            n_patches=int(self.config.n_patches),
+            grid_size=int(self.config.grid_size),
+            objective_for_mask=objective_for_mask,
+            full_objective=torch.ones((), device=dev, dtype=dtype),
+            baseline_objective=torch.zeros((), device=dev, dtype=dtype),
+            irrelevance=irr,
+            config=FRIConfig(
+                steps=int(self.config.cautious_steps),
+                lr=float(self.config.cautious_lr),
+                lr_end=float(self.config.cautious_lr_end),
+                tv_weight=float(self.config.cautious_tv_weight),
+                irrelevance_weight=float(self.config.cautious_irr_weight),
+                init_prob=float(self.config.cautious_init_prob),
+                seed=int(self.config.cautious_seed),
+            ),
+            device=dev,
+            dtype=dtype,
+        )
+        probs = np.asarray(fri.scores, dtype=np.float32)
         full_order = np.argsort(-probs, kind="mergesort")
         probs_max = float(probs.max()) if probs.size > 0 else 0.0
         normalized_attribution = (probs / probs_max).astype(np.float32) if probs_max > 0 else np.zeros_like(probs)
@@ -1099,8 +1062,6 @@ class LegacyRuntime:
         effective_delta = float((full_activation - baseline_activation).detach().cpu())
         dtype = capture.patch_tokens.dtype
         dev = capture.patch_tokens.device
-        generator = torch.Generator(device=dev)
-        generator.manual_seed(int(self.config.cautious_seed))
         metric_name = "feature_activation_delta_recovery"
 
         def objective_for_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -1155,43 +1116,26 @@ class LegacyRuntime:
             token_x,
             feature_id,
         ).to(device=dev, dtype=dtype)
-        logit_init = math.log(self.config.cautious_init_prob / (1.0 - self.config.cautious_init_prob))
-        log_alphas = torch.full((self.config.n_patches,), logit_init, device=dev, dtype=dtype)
-        m = torch.zeros_like(log_alphas)
-        v = torch.zeros_like(log_alphas)
-        beta1, beta2, eps = 0.9, 0.999, 1e-8
-
-        def tv_loss(values: torch.Tensor) -> torch.Tensor:
-            grid = values.view(self.config.grid_size, self.config.grid_size)
-            return (grid[:, :-1] - grid[:, 1:]).abs().sum() + (grid[:-1, :] - grid[1:, :]).abs().sum()
-
-        for step in range(int(self.config.cautious_steps)):
-            frac = step / max(int(self.config.cautious_steps) - 1, 1)
-            cur_lr = float(self.config.cautious_lr_end) + 0.5 * (
-                float(self.config.cautious_lr) - float(self.config.cautious_lr_end)
-            ) * (1.0 + math.cos(math.pi * frac))
-            budget = float(torch.rand(1, generator=generator, device=dev).item() * self.config.n_patches)
-            la_req = log_alphas.clone().requires_grad_(True)
-            probs = torch.sigmoid(la_req)
-            mass = probs / (probs.sum() + 1e-8)
-            soft_mask = (mass * budget).clamp(max=1.0)
-            objective = objective_for_mask(soft_mask)
-            loss = (1.0 - objective) + float(self.config.cautious_irr_weight) * (probs * irr).sum()
-            loss = loss + float(self.config.cautious_tv_weight) * tv_loss(probs)
-            loss.backward()
-            grad = la_req.grad.detach()
-            timestep = step + 1
-            m = beta1 * m + (1.0 - beta1) * grad
-            v = beta2 * v + (1.0 - beta2) * grad * grad
-            m_hat = m / (1.0 - beta1**timestep)
-            v_hat = v / (1.0 - beta2**timestep)
-            adam_dir = m_hat / (v_hat.sqrt() + eps)
-            mask = (adam_dir * grad > 0).to(dtype=dtype)
-            active = mask.sum().clamp(min=1.0)
-            mask = mask * (self.config.n_patches / active)
-            log_alphas = log_alphas - cur_lr * adam_dir * mask
-
-        probs = torch.sigmoid(log_alphas).detach().cpu().numpy().astype(np.float32)
+        fri = run_fri(
+            n_patches=int(self.config.n_patches),
+            grid_size=int(self.config.grid_size),
+            objective_for_mask=objective_for_mask,
+            full_objective=torch.ones((), device=dev, dtype=dtype),
+            baseline_objective=torch.zeros((), device=dev, dtype=dtype),
+            irrelevance=irr,
+            config=FRIConfig(
+                steps=int(self.config.cautious_steps),
+                lr=float(self.config.cautious_lr),
+                lr_end=float(self.config.cautious_lr_end),
+                tv_weight=float(self.config.cautious_tv_weight),
+                irrelevance_weight=float(self.config.cautious_irr_weight),
+                init_prob=float(self.config.cautious_init_prob),
+                seed=int(self.config.cautious_seed),
+            ),
+            device=dev,
+            dtype=dtype,
+        )
+        probs = np.asarray(fri.scores, dtype=np.float32)
         full_order = np.argsort(-probs, kind="mergesort")
         probs_max = float(probs.max()) if probs.size > 0 else 0.0
         normalized_attribution = (probs / probs_max).astype(np.float32) if probs_max > 0 else np.zeros_like(probs)
