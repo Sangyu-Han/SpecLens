@@ -252,8 +252,14 @@ METHODS = (
     "attnlrp_ixg",
     "inflow_erf",
     "cautious_cos",
+    "cautious_cos_x2",
+    "fri_delete",
+    "fri_hybrid_05",
+    "fri_hybrid_05_alt",
+    "fri_hybrid_05_alt_x2",
+    "fri_sinkhorn_05_alt",
 )
-MAIN_METRICS = ("stoch_ins_delta", "insertion_auc", "mas_ins_auc", "rep_idsds")
+MAIN_METRICS = ("stoch_ins_delta", "insertion_auc", "mas_ins_auc", "deletion_auc", "rep_idsds")
 
 
 def _detect_legacy_mm_path() -> Path:
@@ -328,6 +334,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cautious-lr-end", type=float, default=0.01)
     parser.add_argument("--cautious-tv-weight", type=float, default=0.01)
     parser.add_argument("--cautious-irr-weight", type=float, default=0.05)
+    parser.add_argument("--cautious-l1-weight", type=float, default=0.0)
     parser.add_argument("--cautious-init-prob", type=float, default=0.5)
     parser.add_argument("--cautious-init-mode", choices=("uniform", "plain_ixg"), default="uniform")
     parser.add_argument("--cautious-reg-warmup-frac", type=float, default=0.0)
@@ -346,7 +353,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cautious-objective-mode",
-        choices=("random_budget_softins", "fixed_budget_softins", "direct_recovery"),
+        choices=(
+            "random_budget_softins",
+            "fixed_budget_softins",
+            "direct_recovery",
+            "random_budget_softdel",
+            "fixed_budget_softdel",
+            "random_budget_hybrid",
+            "fixed_budget_hybrid",
+            "random_budget_sinkhorn_softins",
+            "fixed_budget_sinkhorn_softins",
+            "random_budget_sinkhorn_softdel",
+            "fixed_budget_sinkhorn_softdel",
+            "random_budget_sinkhorn_hybrid",
+            "fixed_budget_sinkhorn_hybrid",
+        ),
         default="random_budget_softins",
     )
     parser.add_argument(
@@ -355,6 +376,73 @@ def parse_args() -> argparse.Namespace:
         default="cautious_adam_cosine",
     )
     parser.add_argument("--cautious-fixed-budget-frac", type=float, default=0.10)
+    parser.add_argument(
+        "--cautious-budget-norm-grad",
+        choices=("full", "detach_denom"),
+        default="full",
+    )
+    parser.add_argument(
+        "--cautious-budget-clamp-grad",
+        choices=("zero", "straight_through"),
+        default="zero",
+    )
+    parser.add_argument(
+        "--cautious-score-mode",
+        choices=(
+            "final",
+            "alpha",
+            "alpha_pos",
+            "delta_alpha",
+            "delta_alpha_pos",
+            "grad_abs",
+            "grad_up",
+            "signed_grad",
+            "final_x_grad",
+            "final_plus_grad",
+            "alpha_x_grad",
+            "softplus_alpha_x_grad",
+            "delta_alpha_x_grad",
+            "del_grad_up",
+            "final_x_del_grad",
+            "alpha_x_del_grad",
+            "softplus_alpha_x_del_grad",
+            "hmean_softplus_alpha_del_grad",
+            "min_softplus_alpha_del_grad",
+            "hmean_final_del_grad",
+            "min_final_del_grad",
+            "delta_alpha_x_del_grad",
+            "final_x_grad_x_del",
+            "delta_alpha_x_grad_x_del",
+            "softplus_alpha_x_grad_x_del",
+            "prune_final",
+            "prune_survival",
+            "prune_survival_x_del",
+            "prune_final_x_del",
+            "prune_dropout_final",
+            "prune_dropout_survival",
+            "prune_protect",
+            "prune_protect_x_final",
+            "prune_dropout_protect",
+            "prune_dropout_protect_x_final",
+            "signed_final_x_grad",
+            "signed_final_plus_grad",
+            "signed_final_x_direct",
+            "signed_final_plus_direct",
+        ),
+        default="final",
+    )
+    parser.add_argument("--cautious-prune-steps", type=int, default=0)
+    parser.add_argument("--cautious-prune-lr", type=float, default=0.05)
+    parser.add_argument("--cautious-prune-lr-end", type=float, default=0.005)
+    parser.add_argument("--cautious-prune-l1-weight", type=float, default=0.02)
+    parser.add_argument("--cautious-prune-tv-weight", type=float, default=0.0)
+    parser.add_argument("--cautious-prune-tau-min", type=float, default=0.60)
+    parser.add_argument("--cautious-prune-tau-max", type=float, default=0.90)
+    parser.add_argument("--cautious-prune-temperature", type=float, default=0.05)
+    parser.add_argument("--cautious-prune-dropout-keep-prob", type=float, default=1.0)
+    parser.add_argument("--cautious-sinkhorn-temperature", type=float, default=0.25)
+    parser.add_argument("--cautious-sinkhorn-iters", type=int, default=12)
+    parser.add_argument("--cautious-sinkhorn-gumbel-scale", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -700,6 +788,44 @@ def _rep_idsds(scores: np.ndarray, del_effects: np.ndarray) -> Dict[str, float]:
     return {"rep_idsds": idsds, "rep_del_pearson": pear}
 
 
+def _deletion_auc(
+    state: mm.SAEState,
+    scores: np.ndarray,
+    *,
+    n_patches: int,
+    budgets: Sequence[int] | None,
+    full_obj: float,
+    baseline_obj: float,
+) -> float:
+    order = np.argsort(-np.asarray(scores, dtype=np.float32).reshape(-1), kind="mergesort")
+    if budgets is None:
+        budget_list = list(range(0, n_patches + 1))
+    else:
+        budget_list = [0]
+        for raw in budgets:
+            k = int(raw)
+            if 0 < k < n_patches and k != budget_list[-1]:
+                budget_list.append(k)
+        if budget_list[-1] != n_patches:
+            budget_list.append(n_patches)
+
+    h_cur = state.h_b0_patches.clone()
+    vals: List[float] = []
+    prev_k = 0
+    for k in budget_list:
+        if k > prev_k:
+            h_cur = h_cur.clone()
+            idx = torch.as_tensor(order[prev_k:k], device=h_cur.device, dtype=torch.long)
+            h_cur[0, idx] = state.baseline[0, idx]
+            prev_k = k
+        block_out = mm._run_injected(state.model, state.x, state.prefix_tokens, h_cur, state.block_idx)
+        act_k = _feature_response(state, block_out)
+        vals.append(mm.baseline_corrected_recovery(act_k, full_obj, baseline_obj))
+
+    xs = np.asarray(budget_list, dtype=np.float64) / float(max(n_patches, 1))
+    return float(np.trapz(vals, xs))
+
+
 def _evaluate_scores(
     state: mm.SAEState,
     scores: np.ndarray,
@@ -749,6 +875,14 @@ def _evaluate_scores(
         mode="single",
         budgets=insertion_budgets,
     )
+    deletion_auc = _deletion_auc(
+        state,
+        scores_norm,
+        n_patches=n_patches,
+        budgets=insertion_budgets,
+        full_obj=full_obj,
+        baseline_obj=baseline_obj,
+    )
     del_effects = mm.single_deletion_effects_n(
         state.model,
         state.sae,
@@ -795,12 +929,78 @@ def _evaluate_scores(
         "mas_ins_auc": float(mas["mas_ins_auc"]),
         "mas_response_auc": float(mas["mas_response_auc"]),
         "mas_penalty_auc": float(mas["mas_penalty_auc"]),
+        "deletion_auc": float(deletion_auc),
         "full_objective": float(mm.baseline_corrected_recovery(full_obj, full_obj, baseline_obj)),
         "baseline_objective": float(baseline_obj),
         "full_raw_objective": float(full_obj),
         "insertion_budgets": insertion_budgets or list(range(0, n_patches + 1)),
         **idsds,
     }
+
+
+def _necessity_objective(state: mm.SAEState):
+    """Single-forward feature-recovery obj(mask[N], 1=keep)->[0,1] from the state (mean baseline)."""
+    dev = state.x.device
+    dtype = state.h_b0_patches.dtype
+    n_patches = int(state.h_b0_patches.shape[1])
+    full_block = mm._run_injected(state.model, state.x, state.prefix_tokens, state.h_b0_patches, state.block_idx)
+    full_obj = _feature_response(state, full_block)
+    base_block = mm._run_injected(state.model, state.x, state.prefix_tokens, state.baseline, state.block_idx)
+    base_obj = _feature_response(state, base_block)
+
+    def obj(mask_np: np.ndarray) -> float:
+        m = torch.as_tensor(np.asarray(mask_np, dtype=np.float32), device=dev, dtype=dtype).view(1, n_patches, 1)
+        h_mix = m * state.h_b0_patches + (1.0 - m) * state.baseline
+        block_out = mm._run_injected(state.model, state.x, state.prefix_tokens, h_mix, state.block_idx)
+        act = _feature_response(state, block_out)
+        return float(mm.baseline_corrected_recovery(act, full_obj, base_obj))
+
+    return obj, n_patches, int(state.tok_max)
+
+
+def _run_necessity(state: mm.SAEState, method: str) -> np.ndarray:
+    """Conditional NECESSITY scores (high=necessary): greedy oracle / local*occ / chunked-conditional.
+    Ranks ALL patches for a fair deletion_auc comparison vs inflow/attnlrp/ig."""
+    obj, n_patches, token = _necessity_objective(state)
+    grid = int(round(math.sqrt(n_patches)))
+
+    def drop(km: np.ndarray, i: int) -> np.ndarray:
+        m = km.copy(); m[i] = 0.0; return m
+
+    full = obj(np.ones(n_patches, dtype=np.float32))
+    if method in {"necessary_localocc", "necessary_chunked"}:
+        single = np.array([full - obj(drop(np.ones(n_patches, np.float32), j)) for j in range(n_patches)], np.float32)
+        r0, c0 = divmod(token, grid)
+        loc = np.array([1.0 / (1 + abs(j // grid - r0) + abs(j % grid - c0)) for j in range(n_patches)], np.float32)
+        prior = single * loc
+        if method == "necessary_localocc":
+            return np.maximum(prior, 0.0).astype(np.float32)
+        cand = [int(i) for i in np.argsort(-prior)][:100]
+        km = np.ones(n_patches, np.float32); order: list[int] = []; rem = list(cand); per = max(1, 100 // 8)
+        while rem:
+            vals = [obj(drop(km, i)) for i in rem]
+            idx = list(np.argsort(vals)[:per])
+            for j in idx:
+                km[rem[j]] = 0.0; order.append(rem[j])
+            for j in sorted(idx, reverse=True):
+                rem.pop(j)
+        order += [int(i) for i in np.argsort(-prior) if int(i) not in set(order)]
+    elif method == "necessary_greedy":
+        km = np.ones(n_patches, np.float32); order = []; rem = list(range(n_patches))
+        while rem:
+            best, bv = None, 1e9
+            for i in rem:
+                v = obj(drop(km, i))
+                if v < bv:
+                    bv, best = v, i
+            km[best] = 0.0; order.append(best); rem.remove(best)
+            if bv <= 0.1 * full:
+                order.extend(rem); break
+    else:
+        raise KeyError(method)
+    scores = np.zeros(n_patches, np.float32)
+    scores[np.asarray(order, dtype=int)] = np.arange(len(order), 0, -1, dtype=np.float32)
+    return scores
 
 
 def _run_method(
@@ -822,7 +1022,22 @@ def _run_method(
         return _run_attnlrp_ixg_generic(state)
     if method == "inflow_erf":
         return _run_inflow_erf_generic(state)
-    if method in {"cautious_cos", "fri"}:
+    if method in {"necessary_greedy", "necessary_localocc", "necessary_chunked"}:
+        return _run_necessity(state, method)
+    fri_methods = {
+        "cautious_cos",
+        "cautious_cos_x2",
+        "fri",
+        "fri_delete",
+        "fri_hybrid_05",
+        "fri_hybrid_05_alt",
+        "fri_hybrid_05_alt_x2",
+        "fri_sinkhorn_05_alt",
+        "relax_direct",
+        "relax_direct_irr",
+        "relax_fixed",
+    }
+    if method in fri_methods:
         n_patches = int(state.h_b0_patches.shape[1])
         grid = int(round(math.sqrt(n_patches)))
         if grid * grid != n_patches:
@@ -830,12 +1045,50 @@ def _run_method(
         init_scores = None
         if str(cautious_kwargs.get("init_mode", "uniform")) == "plain_ixg":
             init_scores = np.asarray(mm.run_plain_ixg(state), dtype=np.float32)
+        fri_kwargs = dict(cautious_kwargs)
+        if method == "fri_delete":
+            fri_kwargs["objective_mode"] = "random_budget_softdel"
+        elif method == "fri_hybrid_05":
+            fri_kwargs["objective_mode"] = "random_budget_hybrid"
+            fri_kwargs["deletion_weight"] = 0.5
+            fri_kwargs["hybrid_schedule"] = "full"
+        elif method in {
+            "fri_hybrid_05_alt",
+            "fri_hybrid_05_alt_x2",
+        }:
+            fri_kwargs["objective_mode"] = "random_budget_hybrid"
+            fri_kwargs["deletion_weight"] = 0.5
+            fri_kwargs["hybrid_schedule"] = "alternating"
+        elif method == "fri_sinkhorn_05_alt":
+            fri_kwargs["objective_mode"] = "random_budget_sinkhorn_hybrid"
+            fri_kwargs["deletion_weight"] = 0.5
+            fri_kwargs["hybrid_schedule"] = "alternating"
+        elif method == "relax_direct":
+            # Fong 2017 / 2024 Suff&Nec imaging: plain soft-mask relaxation (NO random budget, NO irr prior)
+            fri_kwargs["objective_mode"] = "direct_recovery"
+            fri_kwargs["irr_weight"] = 0.0
+            fri_kwargs["l1_weight"] = 0.02
+            fri_kwargs["tv_weight"] = 0.02
+            fri_kwargs["implementation"] = "core"
+        elif method == "relax_direct_irr":
+            # direct relaxation WITH FRI's irr prior -> isolates the random-budget contribution alone
+            fri_kwargs["objective_mode"] = "direct_recovery"
+            fri_kwargs["implementation"] = "core"
+        elif method == "relax_fixed":
+            # Fong 2019 extremal-perturbation proxy: fixed-area soft mask (single area)
+            fri_kwargs["objective_mode"] = "fixed_budget_softins"
+            fri_kwargs["fixed_budget_frac"] = 0.2
+            fri_kwargs["irr_weight"] = 0.0
+            fri_kwargs["implementation"] = "core"
+        method_steps = int(cautious_steps)
+        if method in {"cautious_cos_x2", "fri_hybrid_05_alt_x2"}:
+            method_steps *= 2
         cfg = _fri_config_from_kwargs(
-            cautious_steps=cautious_steps,
-            cautious_kwargs=cautious_kwargs,
+            cautious_steps=method_steps,
+            cautious_kwargs=fri_kwargs,
             init_scores=init_scores,
         )
-        implementation = str(cautious_kwargs.get("implementation", "legacy"))
+        implementation = str(fri_kwargs.get("implementation", "legacy"))
         if implementation == "legacy":
             return _run_legacy_cautious_cos(state, n_patches, grid, cfg)
         if implementation == "core":
@@ -863,6 +1116,7 @@ def _fri_config_from_kwargs(
         lr_end=float(cautious_kwargs.get("lr_end", 0.01)),
         tv_weight=float(cautious_kwargs.get("tv_weight", 0.01)),
         irrelevance_weight=float(cautious_kwargs.get("irr_weight", 0.05)),
+        l1_weight=float(cautious_kwargs.get("l1_weight", 0.0)),
         init_prob=float(cautious_kwargs.get("init_prob", 0.5)),
         init_scores=init_scores,
         reg_warmup_frac=float(cautious_kwargs.get("reg_warmup_frac", 0.0)),
@@ -872,6 +1126,23 @@ def _fri_config_from_kwargs(
         objective_mode=str(cautious_kwargs.get("objective_mode", "random_budget_softins")),
         optimizer_mode=str(cautious_kwargs.get("optimizer_mode", "cautious_adam_cosine")),
         fixed_budget_frac=float(cautious_kwargs.get("fixed_budget_frac", 0.10)),
+        deletion_weight=float(cautious_kwargs.get("deletion_weight", 1.0)),
+        hybrid_schedule=str(cautious_kwargs.get("hybrid_schedule", "full")),
+        budget_norm_grad=str(cautious_kwargs.get("budget_norm_grad", "full")),
+        budget_clamp_grad=str(cautious_kwargs.get("budget_clamp_grad", "zero")),
+        score_mode=str(cautious_kwargs.get("score_mode", "final")),
+        prune_steps=int(cautious_kwargs.get("prune_steps", 0)),
+        prune_lr=float(cautious_kwargs.get("prune_lr", 0.05)),
+        prune_lr_end=float(cautious_kwargs.get("prune_lr_end", 0.005)),
+        prune_l1_weight=float(cautious_kwargs.get("prune_l1_weight", 0.02)),
+        prune_tv_weight=float(cautious_kwargs.get("prune_tv_weight", 0.0)),
+        prune_tau_min=float(cautious_kwargs.get("prune_tau_min", 0.60)),
+        prune_tau_max=float(cautious_kwargs.get("prune_tau_max", 0.90)),
+        prune_temperature=float(cautious_kwargs.get("prune_temperature", 0.05)),
+        prune_dropout_keep_prob=float(cautious_kwargs.get("prune_dropout_keep_prob", 1.0)),
+        sinkhorn_temperature=float(cautious_kwargs.get("sinkhorn_temperature", 0.25)),
+        sinkhorn_iters=int(cautious_kwargs.get("sinkhorn_iters", 12)),
+        sinkhorn_gumbel_scale=float(cautious_kwargs.get("sinkhorn_gumbel_scale", 0.0)),
         seed=int(cautious_kwargs.get("seed", 0)),
     )
 
@@ -1078,6 +1349,7 @@ def _make_run_meta(pack_specs: Dict[str, Dict[str, Any]], args: argparse.Namespa
         "cautious_lr_end": float(args.cautious_lr_end),
         "cautious_tv_weight": float(args.cautious_tv_weight),
         "cautious_irr_weight": float(args.cautious_irr_weight),
+        "cautious_l1_weight": float(args.cautious_l1_weight),
         "cautious_init_prob": float(args.cautious_init_prob),
         "cautious_init_mode": str(args.cautious_init_mode),
         "cautious_reg_warmup_frac": float(args.cautious_reg_warmup_frac),
@@ -1087,6 +1359,21 @@ def _make_run_meta(pack_specs: Dict[str, Dict[str, Any]], args: argparse.Namespa
         "cautious_objective_mode": str(args.cautious_objective_mode),
         "cautious_optimizer_mode": str(args.cautious_optimizer_mode),
         "cautious_fixed_budget_frac": float(args.cautious_fixed_budget_frac),
+        "cautious_budget_norm_grad": str(args.cautious_budget_norm_grad),
+        "cautious_budget_clamp_grad": str(args.cautious_budget_clamp_grad),
+        "cautious_score_mode": str(args.cautious_score_mode),
+        "cautious_prune_steps": int(args.cautious_prune_steps),
+        "cautious_prune_lr": float(args.cautious_prune_lr),
+        "cautious_prune_lr_end": float(args.cautious_prune_lr_end),
+        "cautious_prune_l1_weight": float(args.cautious_prune_l1_weight),
+        "cautious_prune_tv_weight": float(args.cautious_prune_tv_weight),
+        "cautious_prune_tau_min": float(args.cautious_prune_tau_min),
+        "cautious_prune_tau_max": float(args.cautious_prune_tau_max),
+        "cautious_prune_temperature": float(args.cautious_prune_temperature),
+        "cautious_prune_dropout_keep_prob": float(args.cautious_prune_dropout_keep_prob),
+        "cautious_sinkhorn_temperature": float(args.cautious_sinkhorn_temperature),
+        "cautious_sinkhorn_iters": int(args.cautious_sinkhorn_iters),
+        "cautious_sinkhorn_gumbel_scale": float(args.cautious_sinkhorn_gumbel_scale),
         "fri_implementation": str(args.fri_implementation),
         "baseline_mode": str(args.baseline_mode),
     }
@@ -1278,6 +1565,7 @@ def main() -> None:
                         "lr_end": float(args.cautious_lr_end),
                         "tv_weight": float(args.cautious_tv_weight),
                         "irr_weight": float(args.cautious_irr_weight),
+                        "l1_weight": float(args.cautious_l1_weight),
                         "init_prob": float(args.cautious_init_prob),
                         "init_mode": str(args.cautious_init_mode),
                         "reg_warmup_frac": float(args.cautious_reg_warmup_frac),
@@ -1287,6 +1575,21 @@ def main() -> None:
                         "objective_mode": str(args.cautious_objective_mode),
                         "optimizer_mode": str(args.cautious_optimizer_mode),
                         "fixed_budget_frac": float(args.cautious_fixed_budget_frac),
+                        "budget_norm_grad": str(args.cautious_budget_norm_grad),
+                        "budget_clamp_grad": str(args.cautious_budget_clamp_grad),
+                        "score_mode": str(args.cautious_score_mode),
+                        "prune_steps": int(args.cautious_prune_steps),
+                        "prune_lr": float(args.cautious_prune_lr),
+                        "prune_lr_end": float(args.cautious_prune_lr_end),
+                        "prune_l1_weight": float(args.cautious_prune_l1_weight),
+                        "prune_tv_weight": float(args.cautious_prune_tv_weight),
+                        "prune_tau_min": float(args.cautious_prune_tau_min),
+                        "prune_tau_max": float(args.cautious_prune_tau_max),
+                        "prune_temperature": float(args.cautious_prune_temperature),
+                        "prune_dropout_keep_prob": float(args.cautious_prune_dropout_keep_prob),
+                        "sinkhorn_temperature": float(args.cautious_sinkhorn_temperature),
+                        "sinkhorn_iters": int(args.cautious_sinkhorn_iters),
+                        "sinkhorn_gumbel_scale": float(args.cautious_sinkhorn_gumbel_scale),
                         "implementation": str(args.fri_implementation),
                         "seed": int(args.seed),
                     },

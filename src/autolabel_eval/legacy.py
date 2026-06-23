@@ -556,9 +556,20 @@ class LegacyRuntime:
         with torch.no_grad():
             full_acts = sae(artifacts.patch_out).get("feature_acts")
             full_activation = full_acts[0, int(token_idx), int(feature_id)].detach()
+            do_forward_masked, get_block_out = self.adapter.make_masked_forward(
+                artifacts.x,
+                artifacts.capture,
+                block_idx=int(block_idx),
+            )
+            dtype = artifacts.capture.patch_tokens.dtype
+            dev = artifacts.capture.patch_tokens.device
+            do_forward_masked(torch.zeros(self.config.n_patches, device=dev, dtype=dtype))
+            prefix = self.adapter.prefix_count()
+            baseline_patch_out = get_block_out()[:, prefix:, :]
+            baseline_activation = sae(baseline_patch_out).get("feature_acts")[0, int(token_idx), int(feature_id)].detach()
         injected_patches = artifacts.capture.patch_tokens.detach().clone().requires_grad_(True)
-        prefix = artifacts.capture.prefix_tokens
-        injected = torch.cat([prefix, injected_patches], dim=1)
+        prefix_tokens = artifacts.capture.prefix_tokens
+        injected = torch.cat([prefix_tokens, injected_patches], dim=1)
         buf: list[torch.Tensor] = []
         pre_hook = self.model.blocks[0].register_forward_pre_hook(lambda _m, _args: (injected,))
         blk_hook = self.model.blocks[int(block_idx)].register_forward_hook(
@@ -577,6 +588,7 @@ class LegacyRuntime:
             token_idx=int(token_idx),
             feature_id=int(feature_id),
             full_activation=full_activation,
+            baseline_activation=baseline_activation,
         )
         grad = torch.autograd.grad(objective, injected_patches, retain_graph=False, create_graph=False)[0]
         grad_norm = grad[0].norm(dim=-1)
