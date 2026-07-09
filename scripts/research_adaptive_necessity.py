@@ -16,6 +16,7 @@ import pandas as pd
 import torch
 
 from research_pred_attribution_bench import CHUNK, F, N, _rank, banzhaf_pred
+from vision_metric_utils import raw_auc_from_hard_curves
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -91,10 +92,11 @@ def main():
                 prior_arr = bz if prior == "bz" else pr_occ
                 prior_cost = args.Mbz if prior == "bz" else c_occ
                 rank, nf = cond_prior(runner, prior_arr, args.M, fk, cp); cost[m] = nf + prior_cost
-            _, dele, _, _ = F.hard_curves(runner, rank); res[m] = round(float(dele), 4)
+            _, dele = raw_auc_from_hard_curves(F, runner, rank, n_patches=N, chunk=CHUNK)
+            res[m] = round(float(dele), 4)
         rows.append(res)
         print(f"{name:12s} | " + " ".join(f"{m}:d{res[m]:.3f}" for m, _, _, _ in CFG), flush=True)
-    print("\n=== MEAN deletion AUC (LOWER=better) + COST (actual forwards) ===")
+    print("\n=== MEAN raw-prob deletion AUC (LOWER=better) + COST (actual forwards) ===")
     for m, _, _, _ in CFG:
         d = float(np.mean([r[m] for r in rows]))
         print(f"  {m:14s} del={d:.3f}  cost~={cost[m]:6d}")

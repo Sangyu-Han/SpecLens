@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-PALRP = "/tmp/PE-AWARE-LRP/NLP"
+PALRP = "/home/sangyu/Desktop/Master/SpecLens/third_party/PE-AWARE-LRP/NLP"
 sys.path.insert(0, PALRP)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from research_xmodel_fri import closure, gen_arith, gen_kv  # noqa: E402

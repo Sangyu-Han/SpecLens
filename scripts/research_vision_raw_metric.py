@@ -17,16 +17,14 @@ import torch
 
 from research_pred_attribution_bench import F, N, banzhaf_pred, grad_pred
 from research_vision_cheap_necessity import chunked_with_prior, single_occ_prior
+from vision_metric_utils import raw_auc_from_hard_curves
 
 REPO = Path(__file__).resolve().parents[1]
-XS = np.linspace(0, 1, N + 1)
 
 
 def raw_auc(runner, score):
     """RAW-prob insertion/deletion AUC in [0,1] (NOT divided by p_full)."""
-    r = F.hard_curves(runner, np.asarray(score, np.float32).reshape(-1))
-    p_ins, p_del = np.asarray(r[2], np.float64), np.asarray(r[3], np.float64)
-    return float(np.trapz(p_ins, XS)), float(np.trapz(p_del, XS))
+    return raw_auc_from_hard_curves(F, runner, np.asarray(score, np.float32).reshape(-1), n_patches=N)
 
 
 def run_model(model_path, n_img, Mbz, dev):

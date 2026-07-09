@@ -2,8 +2,8 @@
 """NECESSITY (and sufficiency) vs INFLOW — the strong vision attention-flow baseline (the correct
 vision comparison, NOT AttnLRP). Methods: greedy-conditional, chunk_bz (Banzhaf-prior conditional),
 banzhaf-raw, single_occ, INFLOW. Both insertion (ins, HIGHER=better) and deletion (del, LOWER=better)
-via F.hard_curves. Question: can our necessity (greedy/chunk_bz) beat inflow on deletion? sufficiency
-(banzhaf) on insertion? CLIP (timm), n images."""
+use raw-prob AUC. Question: can our necessity (greedy/chunk_bz) beat inflow on deletion?
+sufficiency (banzhaf) on insertion? CLIP (timm), n images."""
 from __future__ import annotations
 
 import argparse
@@ -16,6 +16,7 @@ import torch
 
 from research_pred_attribution_bench import CHUNK, F, N, _rank, banzhaf_pred, greedy_pred
 from research_vision_cheap_necessity import chunked_with_prior, single_occ_prior
+from vision_metric_utils import raw_auc_from_hard_curves
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -55,13 +56,13 @@ def main():
               "banzhaf": bz, "single_occ": pr_occ, "inflow": inflow}
         res = {"case": name}
         for m, s in sc.items():
-            ins, dele, _, _ = F.hard_curves(runner, s)
+            ins, dele = raw_auc_from_hard_curves(F, runner, s, n_patches=N, chunk=CHUNK)
             res[m + "_del"] = round(float(dele), 4); res[m + "_ins"] = round(float(ins), 4)
         rows.append(res)
         print(f"{name:12s} | DEL greedy {res['greedy_del']:.3f} chunk_bz {res['chunk_bz_del']:.3f} "
               f"banzhaf {res['banzhaf_del']:.3f} INFLOW {res['inflow_del']:.3f} | INS banzhaf {res['banzhaf_ins']:.3f} "
               f"INFLOW {res['inflow_ins']:.3f}", flush=True)
-    print("\n=== vs INFLOW (DEL ↓ necessity, INS ↑ sufficiency) ===")
+    print("\n=== vs INFLOW RAW-PROB AUC (DEL ↓ necessity, INS ↑ sufficiency) ===")
     for m in ["greedy", "chunk_bz", "banzhaf", "single_occ", "inflow"]:
         d = float(np.mean([r[m + "_del"] for r in rows])); i = float(np.mean([r[m + "_ins"] for r in rows]))
         print(f"  {m:11s} del={d:.3f}  ins={i:.3f}")

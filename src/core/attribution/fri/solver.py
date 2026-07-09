@@ -24,13 +24,22 @@ class FRIConfig:
     l1_weight: float = 0.0
     init_prob: float = 0.5
     init_scores: Optional[np.ndarray] = None
+    init_score_prob_floor: float = 0.05
+    init_score_prob_ceiling: float = 0.95
     reg_warmup_frac: float = 0.0
     restarts: int = 1
     budget_samples: int = 1
     select_best: bool = False
     objective_mode: str = "random_budget_softins"
     optimizer_mode: str = "cautious_adam_cosine"
+    optimizer_weight_decay: float = 0.0
+    optimizer_grad_clip_norm: float = 0.0
     fixed_budget_frac: float = 0.10
+    random_budget_distribution: str = "uniform"
+    random_budget_batch_mode: str = "independent"
+    random_budget_batch_std: float = 0.08
+    random_budget_loss_weight_mode: str = "uniform"
+    insertion_weight: float = 1.0
     deletion_weight: float = 1.0
     hybrid_schedule: str = "full"
     budget_norm_grad: str = "full"
@@ -57,6 +66,14 @@ class FRIConfig:
     threshold_temperature_end: float = 0.0
     threshold_temperature_cycle: str = ""
     threshold_temperature_mixture: str = ""
+    budget_mask_noise_mode: str = ""
+    budget_mask_noise_prob: float = 0.0
+    budget_mask_noise_density: float = float("nan")
+    score_logit_noise_mode: str = ""
+    score_logit_noise_prob: float = 0.0
+    score_logit_noise_force: float = 4.0
+    incumbent_dropout_prob: float = 0.0
+    incumbent_dropout_power: float = 1.0
     seed: int = 0
 
 
@@ -163,8 +180,11 @@ def run_fri(
     def _init_log_alphas() -> torch.Tensor:
         if cfg.init_scores is not None:
             init_norm = _normalize_scores(np.asarray(cfg.init_scores, dtype=np.float32).reshape(-1))
-            init_floor = 0.05
-            init_probs = init_floor + (1.0 - 2.0 * init_floor) * init_norm
+            init_floor = max(1e-4, min(float(cfg.init_score_prob_floor), 1.0 - 1e-4))
+            init_ceiling = max(1e-4, min(float(cfg.init_score_prob_ceiling), 1.0 - 1e-4))
+            if init_ceiling < init_floor:
+                init_floor, init_ceiling = init_ceiling, init_floor
+            init_probs = init_floor + (init_ceiling - init_floor) * init_norm
             return torch.tensor([_logit(float(p)) for p in init_probs], device=dev, dtype=dtype)
         return torch.full((n_patches,), _logit(float(cfg.init_prob)), device=dev, dtype=dtype)
 
@@ -381,6 +401,102 @@ def run_fri(
                 return raw_w + (clamped - raw_w).detach()
             raise ValueError(f"Unknown FRI budget_clamp_grad: {cfg.budget_clamp_grad!r}")
 
+        def _budget_mask_density(budget: float) -> float:
+            explicit = float(cfg.budget_mask_noise_density)
+            if math.isfinite(explicit):
+                return max(0.0, min(explicit, 1.0))
+            return max(0.0, min(float(budget) / float(max(n_patches, 1)), 1.0))
+
+        def _apply_budget_mask_noise(mask_w: torch.Tensor, budget: float) -> torch.Tensor:
+            mode = str(cfg.budget_mask_noise_mode).strip()
+            prob = max(0.0, min(float(cfg.budget_mask_noise_prob), 1.0))
+            if not mode or prob <= 0.0:
+                return mask_w
+            if mode == "dropout":
+                keep = (
+                    torch.rand(n_patches, generator=generator, device=dev, dtype=dtype) >= prob
+                ).to(dtype=dtype)
+                return mask_w * keep
+            if mode == "saltpepper":
+                replace = (
+                    torch.rand(n_patches, generator=generator, device=dev, dtype=dtype) < prob
+                )
+                density = _budget_mask_density(budget)
+                noise = (
+                    torch.rand(n_patches, generator=generator, device=dev, dtype=dtype) < density
+                ).to(dtype=dtype)
+                return torch.where(replace, noise, mask_w)
+            if mode == "force_onoff":
+                replace = (
+                    torch.rand(n_patches, generator=generator, device=dev, dtype=dtype) < prob
+                )
+                noise = (
+                    torch.rand(n_patches, generator=generator, device=dev, dtype=dtype) < 0.5
+                ).to(dtype=dtype)
+                return torch.where(replace, noise, mask_w)
+            raise ValueError(f"Unknown FRI budget_mask_noise_mode: {mode!r}")
+
+        def _apply_score_logit_noise(logits: torch.Tensor) -> torch.Tensor:
+            mode = str(cfg.score_logit_noise_mode).strip()
+            prob = max(0.0, min(float(cfg.score_logit_noise_prob), 1.0))
+            if not mode or prob <= 0.0:
+                return logits
+            replace = torch.rand(n_patches, generator=generator, device=dev, dtype=dtype) < prob
+            force = float(cfg.score_logit_noise_force)
+            if mode == "random":
+                signs = torch.where(
+                    torch.rand(n_patches, generator=generator, device=dev, dtype=dtype) < 0.5,
+                    torch.full((n_patches,), -1.0, device=dev, dtype=dtype),
+                    torch.full((n_patches,), 1.0, device=dev, dtype=dtype),
+                )
+                target = signs * force
+            elif mode == "force_on":
+                target = torch.full_like(logits, force)
+            elif mode == "force_off":
+                target = torch.full_like(logits, -force)
+            elif mode == "reverse":
+                target = -logits.detach()
+            elif mode == "forward":
+                centered = logits.detach() - logits.detach().mean()
+                signs = torch.where(centered >= 0, torch.ones_like(logits), -torch.ones_like(logits))
+                target = logits.detach() + signs * force
+            else:
+                raise ValueError(f"Unknown FRI score_logit_noise_mode: {mode!r}")
+            perturbed = torch.where(replace, target, logits)
+            return logits + (perturbed - logits).detach()
+
+        def _apply_incumbent_dropout(mask_w: torch.Tensor, mask_probs: torch.Tensor) -> torch.Tensor:
+            prob = max(0.0, min(float(cfg.incumbent_dropout_prob), 1.0))
+            if prob <= 0.0:
+                return mask_w
+            ref = mask_probs.detach().clamp(min=0.0)
+            ref = ref / ref.max().clamp(min=1e-8)
+            power = max(float(cfg.incumbent_dropout_power), 1e-6)
+            drop_prob = (prob * ref.pow(power)).clamp(min=0.0, max=1.0)
+            keep = (
+                torch.rand(n_patches, generator=generator, device=dev, dtype=dtype) >= drop_prob
+            ).to(dtype=dtype)
+            return mask_w * keep
+
+        def _sample_budget_frac() -> torch.Tensor:
+            mode = str(cfg.random_budget_distribution).strip() or "uniform"
+            u = torch.rand(1, generator=generator, device=dev, dtype=dtype)[0]
+            if mode == "uniform":
+                return u
+            if mode == "low":
+                return u * u
+            if mode == "high":
+                return 1.0 - (1.0 - u) * (1.0 - u)
+            if mode == "mid":
+                v = torch.rand(1, generator=generator, device=dev, dtype=dtype)[0]
+                return (0.5 + 0.5 * (u - v)).clamp(min=0.0, max=1.0)
+            if mode == "bimodal":
+                v = torch.rand(1, generator=generator, device=dev, dtype=dtype)[0]
+                low = 0.5 * (v * v)
+                high = 1.0 - 0.5 * ((1.0 - v) * (1.0 - v))
+                return torch.where(u < 0.5, low, high)
+            raise ValueError(f"Unknown FRI random_budget_distribution: {mode!r}")
+
         rank_weights = torch.linspace(1.0, 0.0, steps=n_patches, device=dev, dtype=dtype)
 
         def _sinkhorn(logits: torch.Tensor) -> torch.Tensor:
@@ -399,7 +515,8 @@ def run_fri(
             if cfg.objective_mode.startswith("random_budget"):
                 if n_patches <= 1:
                     return 1
-                return int(torch.randint(1, n_patches, (1,), generator=generator, device=dev).item())
+                budget = int(round(float(_sample_budget_frac().detach().cpu()) * float(n_patches)))
+                return max(1, min(budget, n_patches))
             budget = int(round(max(0.0, min(float(cfg.fixed_budget_frac), 1.0)) * n_patches))
             return max(1, min(budget, n_patches))
 
@@ -419,15 +536,92 @@ def run_fri(
             cur_lr = float(cfg.lr_end) + 0.5 * (float(cfg.lr) - float(cfg.lr_end)) * (
                 1 + math.cos(math.pi * frac)
             )
+            budget_batch_mode = str(cfg.random_budget_batch_mode).strip() or "independent"
+            budget_center_frac: torch.Tensor | None = None
+            if budget_batch_mode == "gaussian":
+                budget_center_frac = _sample_budget_frac()
+            elif budget_batch_mode not in {"independent", "stratified", "lowmid_stratified"}:
+                raise ValueError(f"Unknown FRI random_budget_batch_mode: {budget_batch_mode!r}")
+
+            def _sample_step_budget_frac(sample_idx: int = 0) -> torch.Tensor:
+                if budget_batch_mode == "independent":
+                    return _sample_budget_frac()
+                if budget_batch_mode == "stratified":
+                    denom = max(n_budget_samples, 1)
+                    center = (float(sample_idx) + 0.5) / float(denom)
+                    center_t = torch.as_tensor(center, device=dev, dtype=dtype)
+                    std_s = max(float(cfg.random_budget_batch_std), 0.0)
+                    if std_s <= 0.0:
+                        return center_t.clamp(min=0.0, max=1.0)
+                    eps_s = torch.randn(1, generator=generator, device=dev, dtype=dtype)[0]
+                    return (center_t + std_s * eps_s).clamp(min=0.0, max=1.0)
+                if budget_batch_mode == "lowmid_stratified":
+                    denom = max(n_budget_samples, 1)
+                    center = (float(sample_idx) + 0.5) / float(2 * denom)
+                    center_t = torch.as_tensor(center, device=dev, dtype=dtype)
+                    std_s = max(float(cfg.random_budget_batch_std), 0.0)
+                    if std_s <= 0.0:
+                        return center_t.clamp(min=0.0, max=0.5)
+                    eps_s = torch.randn(1, generator=generator, device=dev, dtype=dtype)[0]
+                    return (center_t + std_s * eps_s).clamp(min=0.0, max=0.5)
+                assert budget_center_frac is not None
+                std = max(float(cfg.random_budget_batch_std), 0.0)
+                if std <= 0.0:
+                    return budget_center_frac
+                eps_budget = torch.randn(1, generator=generator, device=dev, dtype=dtype)[0]
+                return (budget_center_frac + std * eps_budget).clamp(min=0.0, max=1.0)
+
+            def _sample_step_budget(sample_idx: int = 0) -> tuple[int, torch.Tensor]:
+                if cfg.objective_mode.startswith("random_budget"):
+                    if n_patches <= 1:
+                        frac_t = torch.ones((), device=dev, dtype=dtype)
+                        return 1, frac_t
+                    frac_t = _sample_step_budget_frac(sample_idx)
+                    budget = int(round(float(frac_t.detach().cpu()) * float(n_patches)))
+                    return max(1, min(budget, n_patches)), frac_t
+                frac_t = torch.as_tensor(
+                    max(0.0, min(float(cfg.fixed_budget_frac), 1.0)),
+                    device=dev,
+                    dtype=dtype,
+                )
+                budget = int(round(float(frac_t.detach().cpu()) * n_patches))
+                return max(1, min(budget, n_patches)), frac_t
+
+            def _periodic_insert_period(schedule: str) -> int:
+                raw = schedule.split(":", 1)[1] if ":" in schedule else schedule.rsplit("_", 1)[-1]
+                try:
+                    return max(2, int(raw))
+                except ValueError as exc:
+                    raise ValueError(f"Invalid FRI hybrid_schedule: {cfg.hybrid_schedule!r}") from exc
 
             la_req = log_alphas.clone().requires_grad_(True)
             probs = torch.sigmoid(la_req)
+            mask_logits = _apply_score_logit_noise(la_req)
+            mask_probs = torch.sigmoid(mask_logits)
             recovery_terms: list[torch.Tensor] = []
+            recovery_weights: list[torch.Tensor] = []
+
+            def _append_recovery(term: torch.Tensor, budget_frac: torch.Tensor | None = None) -> None:
+                recovery_terms.append(term)
+                mode = str(cfg.random_budget_loss_weight_mode).strip() or "uniform"
+                if budget_frac is None or mode == "uniform":
+                    recovery_weights.append(torch.ones((), device=dev, dtype=dtype))
+                    return
+                frac_w = budget_frac.detach().to(device=dev, dtype=dtype)
+                frac_w = frac_w.clamp(min=1.0 / float(max(n_patches, 1)), max=1.0)
+                if mode == "inv_sqrt_budget":
+                    recovery_weights.append(torch.rsqrt(frac_w))
+                    return
+                if mode == "inv_budget":
+                    recovery_weights.append(1.0 / frac_w)
+                    return
+                raise ValueError(f"Unknown FRI random_budget_loss_weight_mode: {mode!r}")
+
             step_phase = "direct"
             if cfg.objective_mode == "direct_recovery":
-                act_masked = objective_for_mask(probs)
+                act_masked = objective_for_mask(mask_probs)
                 recovery = _baseline_corrected_recovery(act_masked, act_orig, act_base)
-                recovery_terms.append(1.0 - recovery)
+                _append_recovery(1.0 - recovery)
             elif cfg.objective_mode in {
                 "random_budget_softins",
                 "fixed_budget_softins",
@@ -436,29 +630,47 @@ def run_fri(
                 "random_budget_hybrid",
                 "fixed_budget_hybrid",
             }:
-                p = _budget_distribution(probs)
-                for _ in range(n_budget_samples):
+                p = _budget_distribution(mask_probs)
+                for sample_i in range(n_budget_samples):
                     if cfg.objective_mode.startswith("random_budget"):
-                        budget = float(torch.rand(1, generator=generator, device=dev).item() * n_patches)
+                        budget_frac_t = _sample_step_budget_frac(sample_i)
+                        budget = float(budget_frac_t.detach().cpu()) * float(n_patches)
                     else:
-                        budget = float(max(0.0, min(float(cfg.fixed_budget_frac), 1.0)) * n_patches)
+                        budget_frac_t = torch.as_tensor(
+                            max(0.0, min(float(cfg.fixed_budget_frac), 1.0)),
+                            device=dev,
+                            dtype=dtype,
+                        )
+                        budget = float(budget_frac_t.detach().cpu()) * float(n_patches)
                     if cfg.objective_mode.endswith("softins"):
                         step_phase = "ins"
-                        w = _clamp_budget_weight(p * budget)
+                        w = _apply_incumbent_dropout(
+                            _apply_budget_mask_noise(_clamp_budget_weight(p * budget), budget),
+                            mask_probs,
+                        )
                         act_masked = objective_for_mask(w)
                         recovery = _baseline_corrected_recovery(act_masked, act_orig, act_base)
-                        recovery_terms.append(1.0 - recovery)
+                        _append_recovery(1.0 - recovery, budget_frac_t)
                     elif cfg.objective_mode.endswith("softdel"):
                         step_phase = "del"
-                        del_w = _clamp_budget_weight(p * budget)
+                        del_w = _apply_incumbent_dropout(
+                            _apply_budget_mask_noise(_clamp_budget_weight(p * budget), budget),
+                            mask_probs,
+                        )
                         keep_w = 1.0 - del_w
                         act_masked = objective_for_mask(keep_w)
                         recovery = _baseline_corrected_recovery(act_masked, act_orig, act_base)
-                        recovery_terms.append(recovery)
+                        _append_recovery(recovery, budget_frac_t)
                     elif cfg.objective_mode.endswith("hybrid"):
                         raw_w = p * budget
-                        ins_w = _clamp_budget_weight(raw_w)
-                        del_w = _clamp_budget_weight(raw_w)
+                        ins_w = _apply_incumbent_dropout(
+                            _apply_budget_mask_noise(_clamp_budget_weight(raw_w), budget),
+                            mask_probs,
+                        )
+                        del_w = _apply_incumbent_dropout(
+                            _apply_budget_mask_noise(_clamp_budget_weight(raw_w), budget),
+                            mask_probs,
+                        )
                         keep_w = 1.0 - del_w
                         schedule = str(cfg.hybrid_schedule)
                         if schedule == "full":
@@ -467,18 +679,34 @@ def run_fri(
                             rec_ins = _baseline_corrected_recovery(act_ins, act_orig, act_base)
                             act_del = objective_for_mask(keep_w)
                             rec_del = _baseline_corrected_recovery(act_del, act_orig, act_base)
-                            recovery_terms.append((1.0 - rec_ins) + float(cfg.deletion_weight) * rec_del)
+                            _append_recovery(
+                                float(cfg.insertion_weight) * (1.0 - rec_ins)
+                                + float(cfg.deletion_weight) * rec_del,
+                                budget_frac_t,
+                            )
                         elif schedule == "alternating":
                             if step % 2 == 0:
                                 step_phase = "ins"
                                 act_ins = objective_for_mask(ins_w)
                                 rec_ins = _baseline_corrected_recovery(act_ins, act_orig, act_base)
-                                recovery_terms.append(1.0 - rec_ins)
+                                _append_recovery(float(cfg.insertion_weight) * (1.0 - rec_ins), budget_frac_t)
                             else:
                                 step_phase = "del"
                                 act_del = objective_for_mask(keep_w)
                                 rec_del = _baseline_corrected_recovery(act_del, act_orig, act_base)
-                                recovery_terms.append(float(cfg.deletion_weight) * rec_del)
+                                _append_recovery(float(cfg.deletion_weight) * rec_del, budget_frac_t)
+                        elif schedule.startswith("periodic_insert"):
+                            period = _periodic_insert_period(schedule)
+                            if step % period == 0:
+                                step_phase = "ins"
+                                act_ins = objective_for_mask(ins_w)
+                                rec_ins = _baseline_corrected_recovery(act_ins, act_orig, act_base)
+                                _append_recovery(float(cfg.insertion_weight) * (1.0 - rec_ins), budget_frac_t)
+                            else:
+                                step_phase = "del"
+                                act_del = objective_for_mask(keep_w)
+                                rec_del = _baseline_corrected_recovery(act_del, act_orig, act_base)
+                                _append_recovery(float(cfg.deletion_weight) * rec_del, budget_frac_t)
                         else:
                             raise ValueError(f"Unknown FRI hybrid_schedule: {cfg.hybrid_schedule!r}")
                     else:
@@ -491,19 +719,19 @@ def run_fri(
                 "random_budget_sinkhorn_hybrid",
                 "fixed_budget_sinkhorn_hybrid",
             }:
-                for _ in range(n_budget_samples):
-                    budget = _sample_budget()
-                    top_w = _sinkhorn_topk_mask(la_req, budget)
+                for sample_i in range(n_budget_samples):
+                    budget, budget_frac_t = _sample_step_budget(sample_i)
+                    top_w = _sinkhorn_topk_mask(mask_logits, budget)
                     if cfg.objective_mode.endswith("softins"):
                         step_phase = "ins"
                         act_masked = objective_for_mask(top_w)
                         recovery = _baseline_corrected_recovery(act_masked, act_orig, act_base)
-                        recovery_terms.append(1.0 - recovery)
+                        _append_recovery(1.0 - recovery, budget_frac_t)
                     elif cfg.objective_mode.endswith("softdel"):
                         step_phase = "del"
                         act_masked = objective_for_mask(1.0 - top_w)
                         recovery = _baseline_corrected_recovery(act_masked, act_orig, act_base)
-                        recovery_terms.append(recovery)
+                        _append_recovery(recovery, budget_frac_t)
                     elif cfg.objective_mode.endswith("hybrid"):
                         schedule = str(cfg.hybrid_schedule)
                         if schedule == "full":
@@ -512,18 +740,34 @@ def run_fri(
                             rec_ins = _baseline_corrected_recovery(act_ins, act_orig, act_base)
                             act_del = objective_for_mask(1.0 - top_w)
                             rec_del = _baseline_corrected_recovery(act_del, act_orig, act_base)
-                            recovery_terms.append((1.0 - rec_ins) + float(cfg.deletion_weight) * rec_del)
+                            _append_recovery(
+                                float(cfg.insertion_weight) * (1.0 - rec_ins)
+                                + float(cfg.deletion_weight) * rec_del,
+                                budget_frac_t,
+                            )
                         elif schedule == "alternating":
                             if step % 2 == 0:
                                 step_phase = "ins"
                                 act_ins = objective_for_mask(top_w)
                                 rec_ins = _baseline_corrected_recovery(act_ins, act_orig, act_base)
-                                recovery_terms.append(1.0 - rec_ins)
+                                _append_recovery(float(cfg.insertion_weight) * (1.0 - rec_ins), budget_frac_t)
                             else:
                                 step_phase = "del"
                                 act_del = objective_for_mask(1.0 - top_w)
                                 rec_del = _baseline_corrected_recovery(act_del, act_orig, act_base)
-                                recovery_terms.append(float(cfg.deletion_weight) * rec_del)
+                                _append_recovery(float(cfg.deletion_weight) * rec_del, budget_frac_t)
+                        elif schedule.startswith("periodic_insert"):
+                            period = _periodic_insert_period(schedule)
+                            if step % period == 0:
+                                step_phase = "ins"
+                                act_ins = objective_for_mask(top_w)
+                                rec_ins = _baseline_corrected_recovery(act_ins, act_orig, act_base)
+                                _append_recovery(float(cfg.insertion_weight) * (1.0 - rec_ins), budget_frac_t)
+                            else:
+                                step_phase = "del"
+                                act_del = objective_for_mask(1.0 - top_w)
+                                rec_del = _baseline_corrected_recovery(act_del, act_orig, act_base)
+                                _append_recovery(float(cfg.deletion_weight) * rec_del, budget_frac_t)
                         else:
                             raise ValueError(f"Unknown FRI hybrid_schedule: {cfg.hybrid_schedule!r}")
                     else:
@@ -542,7 +786,7 @@ def run_fri(
                 "random_budget_threshold_sinkhorn_hybrid",
                 "fixed_budget_threshold_sinkhorn_hybrid",
             }:
-                p = _budget_distribution(probs)
+                p = _budget_distribution(mask_probs)
                 threshold_cycle_raw = str(cfg.threshold_value_cycle).strip()
                 if threshold_cycle_raw:
                     thresholds = [
@@ -606,18 +850,24 @@ def run_fri(
                         )
                 else:
                     temp_vals = [float(temp_t.detach().cpu())]
-                for _ in range(n_budget_samples):
+                for sample_i in range(n_budget_samples):
                     if "sinkhorn" in cfg.objective_mode:
-                        budget_i = _sample_budget()
-                        top_w = _sinkhorn_topk_mask(la_req, budget_i)
+                        budget_i, budget_frac_t = _sample_step_budget(sample_i)
+                        top_w = _sinkhorn_topk_mask(mask_logits, budget_i)
                         keep_w = 1.0 - top_w
                     elif cfg.objective_mode.startswith("random_budget"):
-                        budget = float(torch.rand(1, generator=generator, device=dev).item() * n_patches)
+                        budget_frac_t = _sample_step_budget_frac(sample_i)
+                        budget = float(budget_frac_t.detach().cpu()) * float(n_patches)
                         raw_w = p * budget
-                        top_w = _clamp_budget_weight(raw_w)
-                        keep_w = 1.0 - _clamp_budget_weight(raw_w)
+                        top_w = _apply_incumbent_dropout(_clamp_budget_weight(raw_w), mask_probs)
+                        keep_w = 1.0 - _apply_incumbent_dropout(_clamp_budget_weight(raw_w), mask_probs)
                     else:
-                        budget = float(max(0.0, min(float(cfg.fixed_budget_frac), 1.0)) * n_patches)
+                        budget_frac_t = torch.as_tensor(
+                            max(0.0, min(float(cfg.fixed_budget_frac), 1.0)),
+                            device=dev,
+                            dtype=dtype,
+                        )
+                        budget = float(budget_frac_t.detach().cpu()) * float(n_patches)
                         raw_w = p * budget
                         top_w = _clamp_budget_weight(raw_w)
                         keep_w = 1.0 - _clamp_budget_weight(raw_w)
@@ -636,24 +886,40 @@ def run_fri(
 
                     if cfg.objective_mode.endswith("softins"):
                         step_phase = "ins"
-                        recovery_terms.append(1.0 - _active(top_w))
+                        _append_recovery(1.0 - _active(top_w), budget_frac_t)
                     elif cfg.objective_mode.endswith("softdel"):
                         step_phase = "del"
-                        recovery_terms.append(_active(keep_w))
+                        _append_recovery(_active(keep_w), budget_frac_t)
                     elif cfg.objective_mode.endswith("hybrid"):
                         schedule = str(cfg.hybrid_schedule)
                         if schedule == "full":
                             step_phase = "hybrid"
-                            recovery_terms.append(
-                                (1.0 - _active(top_w)) + float(cfg.deletion_weight) * _active(keep_w)
+                            _append_recovery(
+                                float(cfg.insertion_weight) * (1.0 - _active(top_w))
+                                + float(cfg.deletion_weight) * _active(keep_w),
+                                budget_frac_t,
                             )
                         elif schedule == "alternating":
                             if step % 2 == 0:
                                 step_phase = "ins"
-                                recovery_terms.append(1.0 - _active(top_w))
+                                _append_recovery(
+                                    float(cfg.insertion_weight) * (1.0 - _active(top_w)),
+                                    budget_frac_t,
+                                )
                             else:
                                 step_phase = "del"
-                                recovery_terms.append(float(cfg.deletion_weight) * _active(keep_w))
+                                _append_recovery(float(cfg.deletion_weight) * _active(keep_w), budget_frac_t)
+                        elif schedule.startswith("periodic_insert"):
+                            period = _periodic_insert_period(schedule)
+                            if step % period == 0:
+                                step_phase = "ins"
+                                _append_recovery(
+                                    float(cfg.insertion_weight) * (1.0 - _active(top_w)),
+                                    budget_frac_t,
+                                )
+                            else:
+                                step_phase = "del"
+                                _append_recovery(float(cfg.deletion_weight) * _active(keep_w), budget_frac_t)
                         else:
                             raise ValueError(f"Unknown FRI hybrid_schedule: {cfg.hybrid_schedule!r}")
                     else:
@@ -661,7 +927,12 @@ def run_fri(
             else:
                 raise ValueError(f"Unknown FRI objective_mode: {cfg.objective_mode!r}")
 
-            recovery_loss = torch.stack(recovery_terms).mean()
+            if len(recovery_terms) == 1:
+                recovery_loss = recovery_terms[0]
+            else:
+                terms_t = torch.stack(recovery_terms)
+                weights_t = torch.stack(recovery_weights).to(device=dev, dtype=dtype)
+                recovery_loss = (terms_t * weights_t).sum() / weights_t.sum().clamp(min=1e-8)
             eff_irr_weight = 0.0 if step < warmup_steps else float(cfg.irrelevance_weight)
             eff_l1_weight = 0.0 if step < warmup_steps else float(cfg.l1_weight)
             eff_tv_weight = 0.0 if step < warmup_steps else float(cfg.tv_weight)
@@ -675,6 +946,10 @@ def run_fri(
                 rec_g = None
             loss.backward()
             g = la_req.grad.detach()
+            clip_norm = float(cfg.optimizer_grad_clip_norm)
+            if clip_norm > 0.0:
+                g_norm = g.pow(2).sum().sqrt()
+                g = g * (clip_norm / g_norm.clamp(min=clip_norm))
             grad_abs_accum = grad_abs_accum + g.abs()
             grad_up_accum = grad_up_accum + (-g).clamp(min=0.0)
             if rec_g is not None:
@@ -696,8 +971,15 @@ def run_fri(
                 step_dir = adam_dir * mask
             elif cfg.optimizer_mode == "adam_cosine":
                 step_dir = adam_dir
+            elif cfg.optimizer_mode == "sgd_cosine":
+                step_dir = g
+            elif cfg.optimizer_mode == "sgd_norm_cosine":
+                step_dir = g / g.pow(2).mean().sqrt().clamp(min=1e-8)
             else:
                 raise ValueError(f"Unknown FRI optimizer_mode: {cfg.optimizer_mode!r}")
+            weight_decay = max(0.0, float(cfg.optimizer_weight_decay))
+            if weight_decay > 0.0:
+                log_alphas = log_alphas * max(0.0, 1.0 - cur_lr * weight_decay)
             log_alphas = log_alphas - cur_lr * step_dir
             probs_after = torch.sigmoid(log_alphas).detach()
             trajectory_sum = trajectory_sum + probs_after
@@ -771,11 +1053,16 @@ def run_fri(
                 prune_loss.backward()
                 pg = la_req_p.grad.detach()
                 pt = prune_step + 1
-                pm = beta1_p * pm + (1 - beta1_p) * pg
-                pv = beta2_p * pv + (1 - beta2_p) * pg * pg
-                pm_hat = pm / (1 - beta1_p**pt)
-                pv_hat = pv / (1 - beta2_p**pt)
-                prune_log_alphas = prune_log_alphas - cur_prune_lr * pm_hat / (pv_hat.sqrt() + eps)
+                if cfg.optimizer_mode == "sgd_cosine":
+                    prune_log_alphas = prune_log_alphas - cur_prune_lr * pg
+                elif cfg.optimizer_mode == "sgd_norm_cosine":
+                    prune_log_alphas = prune_log_alphas - cur_prune_lr * pg / pg.pow(2).mean().sqrt().clamp(min=1e-8)
+                else:
+                    pm = beta1_p * pm + (1 - beta1_p) * pg
+                    pv = beta2_p * pv + (1 - beta2_p) * pg * pg
+                    pm_hat = pm / (1 - beta1_p**pt)
+                    pv_hat = pv / (1 - beta2_p**pt)
+                    prune_log_alphas = prune_log_alphas - cur_prune_lr * pm_hat / (pv_hat.sqrt() + eps)
                 survival = survival + torch.sigmoid(prune_log_alphas).detach()
             return torch.sigmoid(prune_log_alphas).detach(), survival, protect
 

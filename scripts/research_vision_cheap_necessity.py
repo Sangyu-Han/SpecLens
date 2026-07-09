@@ -5,7 +5,7 @@ SINGLE-OCC prior, which MISSES redundant patches (removing one backup does not h
 NEW: use the cooperative-Banzhaf marginal as the prior (it averages over coalitions, so a redundant
 patch shows positive marginal in the coalitions where its primary is absent) -> the candidate set
 COVERS the redundant supporters -> chunked-greedy on those candidates resolves redundancy at ~20x
-lower cost. Compare deletion AUC (LOWER=better necessity) + cost: greedy / chunked-singleocc /
+lower cost. Compare raw-prob deletion AUC (LOWER=better necessity) + cost: greedy / chunked-singleocc /
 chunked-banzhaf / raw-banzhaf, on CLIP."""
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import pandas as pd
 import torch
 
 from research_pred_attribution_bench import CHUNK, F, N, _rank, banzhaf_pred, greedy_pred
+from vision_metric_utils import raw_auc_from_hard_curves
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -81,11 +82,12 @@ def main():
                 "chunked_bz": args.Mbz + args.M * (args.R + 1) // 2, "banzhaf": args.Mbz}
         res = {"case": name, "k": int(k)}
         for m, s in sc.items():
-            _, dele, _, _ = F.hard_curves(runner, s); res[m + "_del"] = round(float(dele), 4)
+            _, dele = raw_auc_from_hard_curves(F, runner, s, n_patches=N, chunk=CHUNK)
+            res[m + "_del"] = round(float(dele), 4)
         rows.append(res)
         print(f"{name:12s} k={k:3d} | greedy:d{res['greedy_del']:.3f} chunked_occ:d{res['chunked_occ_del']:.3f} "
               f"chunked_bz:d{res['chunked_bz_del']:.3f} banzhaf:d{res['banzhaf_del']:.3f}", flush=True)
-    print("\n=== MEAN deletion AUC (LOWER=better necessity) + COST (forwards) ===")
+    print("\n=== MEAN raw-prob deletion AUC (LOWER=better necessity) + COST (forwards) ===")
     for m in ["greedy", "chunked_occ", "chunked_bz", "banzhaf"]:
         d = float(np.mean([r[m + "_del"] for r in rows]))
         print(f"  {m:12s} del={d:.3f}  cost~={cost[m]:6d}")

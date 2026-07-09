@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """CLIP prediction-attribution benchmark: our NECESSITY (greedy/chunked/soft-mask) + FRI
 (sufficiency) vs standard baselines (inflow, gradient, integrated-gradients) on ImageNet
-classification. Metrics: deletion AUC (↓ = necessity) + insertion AUC (↑ = sufficiency) via
-hard_curves. Shows the two-pillar on STANDARD prediction attribution + whether conditional
+classification. Metrics: raw-prob deletion AUC (↓ = necessity) + insertion AUC (↑ = sufficiency).
+Shows the two-pillar on STANDARD prediction attribution + whether conditional
 necessity beats the baselines at deletion."""
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+
+from vision_metric_utils import raw_auc_from_hard_curves
 
 REPO = Path(__file__).resolve().parents[1]
 FPATH = REPO.parent / "_fri_research_archive_20260610/scripts/research_fri_frontier.py"
@@ -149,10 +151,11 @@ def main():
         sc["ig"] = ig_pred(runner)
         res = {"case": name, "target": target, "k": int(k)}
         for m in methods:
-            ins, dele, _, _ = F.hard_curves(runner, sc[m]); res[m + "_del"] = round(dele, 4); res[m + "_ins"] = round(ins, 4)
+            ins, dele = raw_auc_from_hard_curves(F, runner, sc[m], n_patches=N, chunk=CHUNK)
+            res[m + "_del"] = round(dele, 4); res[m + "_ins"] = round(ins, 4)
         rows.append(res)
         print(f"{name:12s} k={k:3d} | " + " ".join(f"{m}:d{res[m+'_del']:.2f}/i{res[m+'_ins']:.2f}" for m in methods), flush=True)
-    print("\n=== MEAN (del ↓ necessity, ins ↑ sufficiency) ===")
+    print("\n=== MEAN RAW-PROB AUC (del ↓ necessity, ins ↑ sufficiency) ===")
     print(f"{'method':10s} {'del_auc':>8s} {'ins_auc':>8s}")
     agg = {}
     for m in methods:

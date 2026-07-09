@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-PALRP = "/tmp/PE-AWARE-LRP/NLP"
+PALRP = "/home/sangyu/Desktop/Master/SpecLens/third_party/PE-AWARE-LRP/NLP"
 sys.path.insert(0, PALRP)
 HUB = "/data/.cache/huggingface/hub"
 MODELS = {"1b": "models--meta-llama--Llama-3.2-1B-Instruct", "8b": "models--meta-llama--Llama-3.1-8B-Instruct"}

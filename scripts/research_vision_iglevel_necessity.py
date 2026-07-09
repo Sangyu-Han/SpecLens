@@ -16,6 +16,7 @@ import pandas as pd
 import torch
 
 from research_pred_attribution_bench import CHUNK, F, N, _rank, banzhaf_pred, grad_pred, ig_pred
+from vision_metric_utils import raw_auc_from_hard_curves
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -65,13 +66,13 @@ def main():
               "inflowcond32": (ic32, u_i32 + 1), "inflowcond64": (ic64, u_i64 + 1)}
         res = {"case": name}; cost = {}
         for m, (s, c) in sc.items():
-            ins, dele, _, _ = F.hard_curves(runner, s)
+            ins, dele = raw_auc_from_hard_curves(F, runner, s, n_patches=N, chunk=CHUNK)
             res[m + "_del"] = round(float(dele), 4); res[m + "_ins"] = round(float(ins), 4); cost[m] = c
         rows.append(res)
         print(f"{name:12s} | DEL inflow {res['inflow_del']:.3f} inflowcond32 {res['inflowcond32_del']:.3f} "
               f"inflowcond64 {res['inflowcond64_del']:.3f} bz64 {res['bz64_del']:.3f} | INS inflow {res['inflow_ins']:.3f} "
               f"bz32 {res['bz32_ins']:.3f} bz64 {res['bz64_ins']:.3f}", flush=True)
-    print("\n=== IG-LEVEL vs INFLOW (DEL ↓ necessity / INS ↑ sufficiency; ~32-64 budget) ===")
+    print("\n=== IG-LEVEL vs INFLOW RAW-PROB AUC (DEL ↓ necessity / INS ↑ sufficiency; ~32-64 budget) ===")
     for m in ["inflow", "bz32", "bz64", "gradcond32", "inflowcond32", "inflowcond64"]:
         d = float(np.mean([r[m + "_del"] for r in rows])); i = float(np.mean([r[m + "_ins"] for r in rows]))
         wd = "" if m == "inflow" else f" delwin {100.0*np.mean([r[m+'_del'] < r['inflow_del'] for r in rows]):.0f}%"
