@@ -41,7 +41,9 @@ METHOD_LABELS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("render", "assemble"), required=True)
+    parser.add_argument(
+        "--stage", choices=("render", "score-mean-alpha", "assemble"), required=True
+    )
     parser.add_argument("--input-results", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path)
     parser.add_argument("--checkpoint", type=Path)
@@ -174,6 +176,14 @@ def rank_bands(support: list[int], requested_groups: int) -> list[list[int]]:
     return [array.astype(int).tolist() for array in arrays if len(array)]
 
 
+def alpha_mask_from_groups(groups: list[dict[str, Any]]) -> np.ndarray:
+    patch_alpha = np.zeros(N_PATCHES, dtype=np.float32)
+    for group in groups:
+        indices = np.asarray(group["patch_indices"], dtype=np.int64)
+        patch_alpha[indices] = float(group["display_alpha"])
+    return patch_alpha
+
+
 def coalition_masks(groups: list[list[int]]) -> np.ndarray:
     output = np.zeros((1 << len(groups), N_PATCHES), dtype=np.float32)
     for coalition in range(1 << len(groups)):
@@ -239,13 +249,13 @@ def hard_support_image(pixels: torch.Tensor, support: list[int]) -> np.ndarray:
     )
 
 
-def alpha_support_image(
+def alpha_support_images(
     pixels: torch.Tensor,
     groups: list[list[int]],
     shapley: list[float],
     *,
     alpha_floor: float,
-) -> tuple[np.ndarray, list[float]]:
+) -> tuple[np.ndarray, np.ndarray, list[float]]:
     positive = np.maximum(np.asarray(shapley, dtype=np.float32), 0.0)
     if float(positive.max(initial=0.0)) > 1e-8:
         normalized = positive / float(positive.max())
@@ -264,11 +274,17 @@ def alpha_support_image(
     support_map = F.interpolate(support_grid, size=(224, 224), mode="nearest")[0, 0].numpy()
     original = unnormalize(pixels[0])
     background = MEAN.numpy().reshape(1, 1, 3)
-    selected_image = original * alpha_map[..., None]
-    rendered = selected_image * support_map[..., None] + background * (
+    black_selected = original * alpha_map[..., None]
+    black_rendered = black_selected * support_map[..., None] + background * (
         1.0 - support_map[..., None]
     )
-    return rendered, alphas.astype(float).tolist()
+    mean_selected = original * alpha_map[..., None] + background * (
+        1.0 - alpha_map[..., None]
+    )
+    mean_rendered = mean_selected * support_map[..., None] + background * (
+        1.0 - support_map[..., None]
+    )
+    return black_rendered, mean_rendered, alphas.astype(float).tolist()
 
 
 def run_render(args: argparse.Namespace) -> None:
@@ -341,17 +357,21 @@ def run_render(args: argparse.Namespace) -> None:
                 "winner_erf": assets / f"{stem}_winner_erf80.jpg",
                 "pruned_erf": assets / f"{stem}_pruned_erf80.jpg",
                 "group_shapley_erf": assets / f"{stem}_group_shapley_erf80.jpg",
+                "group_shapley_mean_erf": (
+                    assets / f"{stem}_group_shapley_mean_erf80.jpg"
+                ),
             }
             save_rgb(unnormalize(pixels[0]), paths["original"])
             save_rgb(hard_support_image(pixels, winner_support), paths["winner_erf"])
             save_rgb(hard_support_image(pixels, pruned), paths["pruned_erf"])
-            alpha_image, group_alphas = alpha_support_image(
+            black_alpha_image, mean_alpha_image, group_alphas = alpha_support_images(
                 pixels,
                 groups,
                 importance.shapley,
                 alpha_floor=float(args.alpha_floor),
             )
-            save_rgb(alpha_image, paths["group_shapley_erf"])
+            save_rgb(black_alpha_image, paths["group_shapley_erf"])
+            save_rgb(mean_alpha_image, paths["group_shapley_mean_erf"])
             output_rows.append(
                 {
                     **record,
@@ -404,6 +424,62 @@ def run_render(args: argparse.Namespace) -> None:
             )
     finally:
         evaluator.close()
+
+
+def run_score_mean_alpha(args: argparse.Namespace) -> None:
+    input_path = require_path(args.input_results, "--input-results")
+    dataset_root = require_path(args.dataset_root, "--dataset-root")
+    _payload, records = load_records(input_path, args.features)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(args.device)
+    sae, model, transform = load_runtime(args, device)
+    evaluator = FeatureEvaluator(model, sae)
+    output_rows: list[dict[str, Any]] = []
+    try:
+        for index, record in enumerate(records, start=1):
+            feature = int(record["feature"])
+            sample_id = int(record["sample_id"])
+            latent = int(record["latent_index"])
+            source_path = dataset_root / str(record["relative_path"])
+            with Image.open(source_path) as source:
+                image = ImageOps.exif_transpose(source).convert("RGB")
+                pixels = transform(image).unsqueeze(0).to(device)
+            mask = torch.from_numpy(alpha_mask_from_groups(record["groups"])).to(
+                device=device, dtype=pixels.dtype
+            )
+            with torch.inference_mode():
+                _pre, hard = evaluator.preactivation(
+                    masks_to_pixels(pixels, mask.reshape(1, -1)),
+                    latent=latent,
+                    feature=feature,
+                )
+            full = float(record["full_hard_activation"])
+            baseline = float(record["baseline_hard_activation"])
+            recovery = (float(hard[0]) - baseline) / max(full - baseline, 1e-8)
+            output_rows.append(
+                {
+                    "feature": feature,
+                    "decile": int(record["decile"]),
+                    "within_decile_rank": int(record["within_decile_rank"]),
+                    "sample_id": sample_id,
+                    "mean_alpha_recovery": float(recovery),
+                }
+            )
+            print(
+                f"[{index}/{len(records)}] f={feature} D{record['decile']} "
+                f"r={record['within_decile_rank']} mean-alpha={recovery:.3f}",
+                flush=True,
+            )
+    finally:
+        evaluator.close()
+    output = {
+        "part_name": args.part_name,
+        "source_results": str(input_path),
+        "records": output_rows,
+    }
+    output_path = args.output_dir / f"mean_alpha_scores_{args.part_name}.json"
+    output_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+    print(f"Wrote {output_path}", flush=True)
     output = {
         "source_results": str(input_path),
         "threshold": 0.80,
@@ -460,9 +536,16 @@ def event_card(record: dict[str, Any]) -> str:
         ),
         (
             record["assets"]["group_shapley_erf"],
-            f"{len(record['groups'])}-group exact Shapley alpha",
+            f"{len(record['groups'])}-group Shapley · black alpha",
         ),
     ]
+    if "group_shapley_mean_erf" in record["assets"]:
+        figures.append(
+            (
+                record["assets"]["group_shapley_mean_erf"],
+                f"{len(record['groups'])}-group Shapley · mean alpha",
+            )
+        )
     figure_html = "".join(
         f'<figure><img src="{html.escape(path)}" loading="lazy">'
         f"<figcaption>{html.escape(caption)}</figcaption></figure>"
@@ -473,14 +556,56 @@ def event_card(record: dict[str, Any]) -> str:
         f"G{item['group']} φ={item['shapley']:.3f}"
         for item in top_groups
     )
+    alpha_recovery = (
+        f" · mean-alpha recovery {float(record['mean_alpha_recovery']):.3f}"
+        if "mean_alpha_recovery" in record
+        else ""
+    )
     return f"""
     <article class="event-card">
       <div class="event-head"><b>#{int(record['within_decile_rank']) + 1}</b>
       {html.escape(str(record['label_name']))}</div>
       <div class="quad">{figure_html}</div>
-      <p>activation {float(record['activation']):.3f} · recovery {float(record['pruned']['support_recovery']):.3f}<br>{html.escape(group_text)}</p>
+      <p>activation {float(record['activation']):.3f} · hard recovery {float(record['pruned']['support_recovery']):.3f}{alpha_recovery}<br>{html.escape(group_text)}</p>
     </article>
     """
+
+
+def ensure_mean_alpha_asset(record: dict[str, Any], output_dir: Path) -> None:
+    assets = record["assets"]
+    if "group_shapley_mean_erf" in assets:
+        return
+    original_path = output_dir / assets["original"]
+    black_path = Path(assets["group_shapley_erf"])
+    mean_name = black_path.name.replace(
+        "_group_shapley_erf80.jpg", "_group_shapley_mean_erf80.jpg"
+    )
+    mean_path = output_dir / black_path.with_name(mean_name)
+    with Image.open(original_path) as source:
+        original = np.asarray(source.convert("RGB"), dtype=np.float32) / 255.0
+    patch_alpha = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+    selected = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+    for group in record["groups"]:
+        for patch_index in group["patch_indices"]:
+            row, column = divmod(int(patch_index), GRID_SIZE)
+            patch_alpha[row, column] = float(group["display_alpha"])
+            selected[row, column] = 1.0
+    alpha_map = np.repeat(
+        np.repeat(patch_alpha, original.shape[0] // GRID_SIZE, axis=0),
+        original.shape[1] // GRID_SIZE,
+        axis=1,
+    )
+    support_map = np.repeat(
+        np.repeat(selected, original.shape[0] // GRID_SIZE, axis=0),
+        original.shape[1] // GRID_SIZE,
+        axis=1,
+    )
+    background = MEAN.numpy().reshape(1, 1, 3)
+    rendered = background + support_map[..., None] * alpha_map[..., None] * (
+        original - background
+    )
+    save_rgb(rendered, mean_path)
+    assets["group_shapley_mean_erf"] = str(mean_path.relative_to(output_dir))
 
 
 def run_assemble(args: argparse.Namespace) -> None:
@@ -514,6 +639,26 @@ def run_assemble(args: argparse.Namespace) -> None:
             int(record["within_decile_rank"]),
         )
     )
+    alpha_scores: dict[tuple[int, int, int], float] = {}
+    for path in sorted(args.output_dir.glob("mean_alpha_scores_*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for row in payload["records"]:
+            key = (
+                int(row["feature"]),
+                int(row["decile"]),
+                int(row["within_decile_rank"]),
+            )
+            alpha_scores[key] = float(row["mean_alpha_recovery"])
+    for record in records:
+        key = (
+            int(record["feature"]),
+            int(record["decile"]),
+            int(record["within_decile_rank"]),
+        )
+        if key in alpha_scores:
+            record["mean_alpha_recovery"] = alpha_scores[key]
+    for record in records:
+        ensure_mean_alpha_asset(record, args.output_dir)
     threshold = float((metadata or {}).get("threshold", 0.80))
     summary = aggregate_rows(records)
     total_winner = sum(int(record["winner"]["support_size"]) for record in records)
@@ -557,6 +702,19 @@ def run_assemble(args: argparse.Namespace) -> None:
         "max_shapley_efficiency_error": max(
             abs(float(record["group_importance"]["efficiency_error"]))
             for record in records
+        ),
+        "mean_alpha_recovery": (
+            float(
+                np.mean(
+                    [
+                        float(record["mean_alpha_recovery"])
+                        for record in records
+                        if "mean_alpha_recovery" in record
+                    ]
+                )
+            )
+            if any("mean_alpha_recovery" in record for record in records)
+            else None
         ),
     }
     output = {
@@ -612,7 +770,7 @@ figure{{margin:0;border:1px solid #dde1de;background:#eceeec}}img{{display:block
 figcaption{{padding:5px 6px;min-height:30px;background:#fff;font-size:11px;line-height:1.3}}.event-card p{{margin:8px 1px 0;font-size:11px;color:#59615c;line-height:1.4}}
 @media(max-width:900px){{main{{padding:14px}}.event-grid{{grid-template-columns:repeat(5,minmax(300px,1fr))}}.event-card{{min-width:300px}}}}
 </style></head><body><main><h1>Perceiver ERF compaction and internal group importance</h1>
-<p class="intro">For each event, choose the smaller exact ERF80 prefix from FRI-64 and IG-32, backward-prune while preserving recovery ≥ 0.80, then divide the retained ranking into up to eight equal-count bands. The final panel evaluates all group coalitions and uses exact group-Shapley values only to darken selected evidence. Grey remains the hard-mask baseline; the alpha panel is an explanatory rendering, not the recovery input.</p>
+<p class="intro">For each event, choose the smaller exact ERF80 prefix from FRI-64 and IG-32, backward-prune while preserving recovery ≥ 0.80, then divide the retained ranking into up to eight equal-count bands. The final panels evaluate all group coalitions and use exact group-Shapley values to blend retained evidence toward either black or the channel-mean baseline. Grey remains the hard-mask baseline; both alpha panels are explanatory renderings, not recovery inputs.</p>
 <p class="intro"><b>Overall:</b> mean k {overall['winner_mean']:.1f} → {overall['pruned_mean']:.1f}; reduction {100 * overall['relative_reduction']:.1f}%; FRI/IG winners {overall['fri_winners']}/{overall['ig_winners']}; k&gt;96 {overall['winner_gt96']} → {overall['pruned_gt96']}.</p>
 <nav>{nav}</nav>{''.join(sections)}</main></body></html>"""
     (args.output_dir / "gallery.html").write_text(page, encoding="utf-8")
@@ -631,8 +789,9 @@ figcaption{{padding:5px 6px;min-height:30px;background:#fff;font-size:11px;line-
         "bands would require 1,024.",
         "4. Compute exact group-Shapley values. The gallery keeps unselected patches "
         "at the grey hard-mask baseline and darkens retained patches according to "
-        "positive Shapley importance. This alpha panel is explanatory rendering only, "
-        "not an input used to establish recovery.",
+        "positive Shapley importance. The gallery provides both black-alpha and "
+        "channel-mean-alpha variants. These panels are explanatory renderings only, "
+        "not inputs used to establish recovery.",
         "",
         "## Checks and headline results",
         "",
@@ -680,6 +839,8 @@ def main() -> None:
     args = parse_args()
     if args.stage == "render":
         run_render(args)
+    elif args.stage == "score-mean-alpha":
+        run_score_mean_alpha(args)
     else:
         run_assemble(args)
 
