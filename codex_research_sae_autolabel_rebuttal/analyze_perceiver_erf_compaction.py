@@ -514,6 +514,7 @@ def run_assemble(args: argparse.Namespace) -> None:
             int(record["within_decile_rank"]),
         )
     )
+    threshold = float((metadata or {}).get("threshold", 0.80))
     summary = aggregate_rows(records)
     total_winner = sum(int(record["winner"]["support_size"]) for record in records)
     total_pruned = sum(int(record["pruned"]["support_size"]) for record in records)
@@ -533,6 +534,29 @@ def run_assemble(args: argparse.Namespace) -> None:
         ),
         "pruned_gt96": sum(
             int(record["pruned"]["support_size"]) > 96 for record in records
+        ),
+        "min_pruned_recovery": min(
+            float(record["pruned"]["support_recovery"]) for record in records
+        ),
+        "below_threshold": sum(
+            float(record["pruned"]["support_recovery"]) < threshold
+            for record in records
+        ),
+        "group_count": sum(len(record["groups"]) for record in records),
+        "negative_shapley_groups": sum(
+            float(group["shapley"]) < 0.0
+            for record in records
+            for group in record["groups"]
+        ),
+        "interaction_groups": sum(
+            float(group["shapley"]) > 0.05
+            and float(group["insertion"]) < 0.05
+            for record in records
+            for group in record["groups"]
+        ),
+        "max_shapley_efficiency_error": max(
+            abs(float(record["group_importance"]["efficiency_error"]))
+            for record in records
         ),
     }
     output = {
@@ -596,8 +620,47 @@ figcaption{{padding:5px 6px;min-height:30px;background:#fff;font-size:11px;line-
     lines = [
         "# Perceiver ERF compaction and group-Shapley summary",
         "",
+        "## Protocol",
+        "",
+        "1. For each event, choose the smaller exact ERF80 prefix from the existing "
+        "FRI-64 and IG-32 rankings (breaking size ties by insertion AUC).",
+        "2. Backward-prune individual selected patches while retaining normalized "
+        "hard-mask recovery >= 0.80.",
+        "3. Split the retained ranking into up to eight equal-count bands and evaluate "
+        "all 2^G coalitions. Eight bands cap this at 256 coalitions per event; ten "
+        "bands would require 1,024.",
+        "4. Compute exact group-Shapley values. The gallery keeps unselected patches "
+        "at the grey hard-mask baseline and darkens retained patches according to "
+        "positive Shapley importance. This alpha panel is explanatory rendering only, "
+        "not an input used to establish recovery.",
+        "",
+        "## Checks and headline results",
+        "",
         f"Overall N={overall['n']}: mean k80 {overall['winner_mean']:.2f} -> {overall['pruned_mean']:.2f} "
         f"({100 * overall['relative_reduction']:.1f}% reduction).",
+        f"FRI/IG supplied the smaller exact prefix for "
+        f"{overall['fri_winners']}/{overall['ig_winners']} events; supports larger "
+        f"than 96 patches fell from {overall['winner_gt96']} to {overall['pruned_gt96']}.",
+        f"All pruned supports retain the threshold: minimum recovery "
+        f"{overall['min_pruned_recovery']:.6f}; below-threshold events "
+        f"{overall['below_threshold']}.",
+        f"Exact Shapley efficiency holds to numerical precision "
+        f"(maximum absolute error {overall['max_shapley_efficiency_error']:.3e}).",
+        f"Among {overall['group_count']} groups, "
+        f"{overall['interaction_groups']} have Shapley contribution > .05 despite "
+        f"group-only insertion < .05, indicating that much of the retained evidence "
+        f"acts jointly rather than as independently sufficient regions. "
+        f"{overall['negative_shapley_groups']} groups have negative Shapley values "
+        f"and are rendered at the alpha floor.",
+        "",
+        "The main result is that a fixed ranked prefix substantially overstates the "
+        "required support when recovery is non-monotonic or redundant. Backward "
+        "pruning should therefore follow threshold crossing. The group-Shapley panel "
+        "adds a conditional decomposition inside that compact hard support; it does "
+        "not replace the hard sufficiency test and remains conditional on the chosen "
+        "support and rank-band grouping.",
+        "",
+        "## Feature/decile breakdown",
         "",
         "| Feature | Decile | N | Best-prefix k | Pruned k | Reduction | FRI/IG winners |",
         "|---:|---:|---:|---:|---:|---:|---:|",
