@@ -486,7 +486,7 @@ table{{margin-top:12px;border-collapse:collapse;background:#fff}}th,td{{padding:
 <p class="intro"><b>N={summary['n']}:</b> mean insertion AUC IxG/FRI {summary['ixg_auc_mean']:.3f}/{summary['fri_auc_mean']:.3f}; FRI AUC wins {summary['fri_auc_wins']}/{summary['n']}; mean k80 IxG/FRI {summary['ixg_k80_mean']:.0f}/{summary['fri_k80_mean']:.0f}; FRI smaller-k wins {summary['fri_k80_wins']}/{summary['n']}.</p>
 {cards}</main></body></html>"""
     (args.output_dir / "gallery.html").write_text(page, encoding="utf-8")
-    report = f"""# Perceiver native-pixel FRI smoke benchmark
+    report = f"""# Perceiver native-pixel FRI benchmark
 
 - N: {summary['n']}
 - Mean insertion AUC, IxG / {fri_label}: {summary['ixg_auc_mean']:.4f} / {summary['fri_auc_mean']:.4f}
