@@ -424,6 +424,18 @@ def run_render(args: argparse.Namespace) -> None:
             )
     finally:
         evaluator.close()
+    output = {
+        "source_results": str(input_path),
+        "threshold": 0.80,
+        "requested_groups": int(args.groups),
+        "prune_passes": int(args.prune_passes),
+        "alpha_floor": float(args.alpha_floor),
+        "part_name": args.part_name,
+        "records": output_rows,
+    }
+    path = args.output_dir / f"results_{args.part_name}.json"
+    path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+    print(f"Wrote {path}", flush=True)
 
 
 def run_score_mean_alpha(args: argparse.Namespace) -> None:
@@ -480,18 +492,6 @@ def run_score_mean_alpha(args: argparse.Namespace) -> None:
     output_path = args.output_dir / f"mean_alpha_scores_{args.part_name}.json"
     output_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
     print(f"Wrote {output_path}", flush=True)
-    output = {
-        "source_results": str(input_path),
-        "threshold": 0.80,
-        "requested_groups": int(args.groups),
-        "prune_passes": int(args.prune_passes),
-        "alpha_floor": float(args.alpha_floor),
-        "part_name": args.part_name,
-        "records": output_rows,
-    }
-    path = args.output_dir / f"results_{args.part_name}.json"
-    path.write_text(json.dumps(output, indent=2), encoding="utf-8")
-    print(f"Wrote {path}", flush=True)
 
 
 def aggregate_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -663,6 +663,11 @@ def run_assemble(args: argparse.Namespace) -> None:
     summary = aggregate_rows(records)
     total_winner = sum(int(record["winner"]["support_size"]) for record in records)
     total_pruned = sum(int(record["pruned"]["support_size"]) for record in records)
+    alpha_recoveries = [
+        float(record["mean_alpha_recovery"])
+        for record in records
+        if "mean_alpha_recovery" in record
+    ]
     overall = {
         "n": len(records),
         "winner_mean": total_winner / len(records),
@@ -704,16 +709,14 @@ def run_assemble(args: argparse.Namespace) -> None:
             for record in records
         ),
         "mean_alpha_recovery": (
-            float(
-                np.mean(
-                    [
-                        float(record["mean_alpha_recovery"])
-                        for record in records
-                        if "mean_alpha_recovery" in record
-                    ]
-                )
-            )
-            if any("mean_alpha_recovery" in record for record in records)
+            float(np.mean(alpha_recoveries)) if alpha_recoveries else None
+        ),
+        "median_alpha_recovery": (
+            float(np.median(alpha_recoveries)) if alpha_recoveries else None
+        ),
+        "alpha_recovery_ge_threshold": (
+            sum(value >= threshold for value in alpha_recoveries)
+            if alpha_recoveries
             else None
         ),
     }
@@ -755,6 +758,15 @@ def run_assemble(args: argparse.Namespace) -> None:
             f'<section class="feature" id="feature-{feature}">'
             f"<h2>Feature {feature}</h2>{''.join(decile_sections)}</section>"
         )
+    alpha_summary = ""
+    if overall["mean_alpha_recovery"] is not None:
+        alpha_summary = (
+            "<p class=\"intro\"><b>Mean-alpha diagnostic:</b> mean activation "
+            f"recovery {overall['mean_alpha_recovery']:.3f}, median "
+            f"{overall['median_alpha_recovery']:.3f}, and ERF80 retention "
+            f"{overall['alpha_recovery_ge_threshold']}/{overall['n']}. This weighted rendering "
+            "does not inherit the hard ERF80 guarantee.</p>"
+        )
     page = f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Perceiver ERF compaction and group Shapley</title><style>
@@ -772,6 +784,7 @@ figcaption{{padding:5px 6px;min-height:30px;background:#fff;font-size:11px;line-
 </style></head><body><main><h1>Perceiver ERF compaction and internal group importance</h1>
 <p class="intro">For each event, choose the smaller exact ERF80 prefix from FRI-64 and IG-32, backward-prune while preserving recovery ≥ 0.80, then divide the retained ranking into up to eight equal-count bands. The final panels evaluate all group coalitions and use exact group-Shapley values to blend retained evidence toward either black or the channel-mean baseline. Grey remains the hard-mask baseline; both alpha panels are explanatory renderings, not recovery inputs.</p>
 <p class="intro"><b>Overall:</b> mean k {overall['winner_mean']:.1f} → {overall['pruned_mean']:.1f}; reduction {100 * overall['relative_reduction']:.1f}%; FRI/IG winners {overall['fri_winners']}/{overall['ig_winners']}; k&gt;96 {overall['winner_gt96']} → {overall['pruned_gt96']}.</p>
+{alpha_summary}
 <nav>{nav}</nav>{''.join(sections)}</main></body></html>"""
     (args.output_dir / "gallery.html").write_text(page, encoding="utf-8")
 
@@ -811,6 +824,16 @@ figcaption{{padding:5px 6px;min-height:30px;background:#fff;font-size:11px;line-
         f"acts jointly rather than as independently sufficient regions. "
         f"{overall['negative_shapley_groups']} groups have negative Shapley values "
         f"and are rendered at the alpha floor.",
+        (
+            f"The channel-mean alpha inputs have mean activation recovery "
+            f"{overall['mean_alpha_recovery']:.3f}, median "
+            f"{overall['median_alpha_recovery']:.3f}, with "
+            f"{overall['alpha_recovery_ge_threshold']}/{overall['n']} retaining "
+            "recovery >= .80; unlike the hard support, this "
+            "weighted rendering does not carry an ERF80 guarantee."
+            if overall["mean_alpha_recovery"] is not None
+            else "Channel-mean alpha recovery was not scored."
+        ),
         "",
         "The main result is that a fixed ranked prefix substantially overstates the "
         "required support when recovery is non-monotonic or redundant. Backward "
