@@ -251,7 +251,7 @@ def alpha_support_image(
         normalized = positive / float(positive.max())
     else:
         normalized = np.ones_like(positive)
-    alphas = float(alpha_floor) + (1.0 - float(alpha_floor)) * np.sqrt(normalized)
+    alphas = float(alpha_floor) + (1.0 - float(alpha_floor)) * normalized
     patch_alpha = np.zeros(N_PATCHES, dtype=np.float32)
     selected = np.zeros(N_PATCHES, dtype=np.float32)
     for group, alpha in zip(groups, alphas, strict=True):
