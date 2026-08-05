@@ -33,12 +33,6 @@ IMAGE_SIZE = 224
 N_PIXELS = IMAGE_SIZE * IMAGE_SIZE
 OLD_GROUP_COUNT = 14 * 14
 REGULARIZER_SCALE = OLD_GROUP_COUNT / N_PIXELS
-METHOD_LABELS = {
-    "native_ixg": "Native IxG",
-    "native_fri16": "Native FRI-16",
-}
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("render", "assemble"), required=True)
@@ -370,6 +364,7 @@ def run_render(args: argparse.Namespace) -> None:
             output_rows.append(
                 {
                     **record,
+                    "fri_steps": int(args.fri_steps),
                     "effective_seed": effective_seed,
                     "native_pixel_count": N_PIXELS,
                     "rank_bucket_size": int(args.rank_bucket_size),
@@ -407,11 +402,12 @@ def run_render(args: argparse.Namespace) -> None:
 def event_card(record: dict[str, Any]) -> str:
     ixg = record["metrics"]["native_ixg"]
     fri = record["metrics"]["native_fri16"]
+    fri_label = f"Native FRI-{int(record['fri_steps'])}"
     figures = [
         (record["assets"]["original"], "Original"),
         (record["assets"]["grouped_pruned"], "Previous grouped, pruned ERF80"),
         (record["assets"]["ixg_heatmap"], "Native IxG heatmap"),
-        (record["assets"]["fri_heatmap"], "Native FRI-16 heatmap"),
+        (record["assets"]["fri_heatmap"], f"{fri_label} heatmap"),
         (
             record["assets"]["ixg_erf"],
             f"IxG hard pixel ERF80 · k≤{ixg['support_size']}",
@@ -434,7 +430,7 @@ def event_card(record: dict[str, Any]) -> str:
       <div class="panels">{figure_html}</div>
       <table><tr><th>Ranking</th><th>k80 upper bound</th><th>fraction</th><th>recovery</th><th>AUC</th></tr>
       <tr><td>Native IxG</td><td>{int(ixg['support_size'])}</td><td>{100*float(ixg['support_fraction']):.1f}%</td><td>{float(ixg['support_recovery']):.3f}</td><td>{float(ixg['auc']):.3f}</td></tr>
-      <tr><td>Native FRI-16</td><td>{int(fri['support_size'])}</td><td>{100*float(fri['support_fraction']):.1f}%</td><td>{float(fri['support_recovery']):.3f}</td><td>{float(fri['auc']):.3f}</td></tr></table>
+      <tr><td>{fri_label}</td><td>{int(fri['support_size'])}</td><td>{100*float(fri['support_fraction']):.1f}%</td><td>{float(fri['support_recovery']):.3f}</td><td>{float(fri['auc']):.3f}</td></tr></table>
     </article>
     """
 
@@ -453,6 +449,10 @@ def run_assemble(args: argparse.Namespace) -> None:
     if len(keys) != len(set(keys)):
         raise RuntimeError("Duplicate event records")
     records.sort(key=lambda row: (int(row["feature"]), int(row["within_decile_rank"])))
+    fri_steps = sorted({int(row["fri_steps"]) for row in records})
+    if len(fri_steps) != 1:
+        raise RuntimeError(f"Mixed FRI step counts are not supported: {fri_steps}")
+    fri_label = f"FRI-{fri_steps[0]}"
     ixg_auc = np.asarray([row["metrics"]["native_ixg"]["auc"] for row in records])
     fri_auc = np.asarray([row["metrics"]["native_fri16"]["auc"] for row in records])
     ixg_k = np.asarray([row["metrics"]["native_ixg"]["support_size"] for row in records])
@@ -481,7 +481,7 @@ main{{max-width:1900px;margin:auto;padding:28px}}h1{{font-size:30px;letter-spaci
 img{{display:block;width:100%;aspect-ratio:1;object-fit:contain;image-rendering:auto}}figcaption{{padding:7px;min-height:34px;font-size:12px}}
 table{{margin-top:12px;border-collapse:collapse;background:#fff}}th,td{{padding:7px 10px;border:1px solid #ccd1cd;text-align:right}}th:first-child,td:first-child{{text-align:left}}
 @media(max-width:1000px){{.panels{{grid-template-columns:repeat(2,minmax(0,1fr))}}main{{padding:14px}}}}
-</style></head><body><main><h1>Perceiver native-pixel IxG vs FRI-16</h1>
+</style></head><body><main><h1>Perceiver native-pixel IxG vs {fri_label}</h1>
 <p class="intro">The attribution variables are all 50,176 native image pixels. Pixels are ranked individually; only hard-curve evaluation groups adjacent ranks into buckets of {int(records[0]['rank_bucket_size'])}. Mean replacement preserves the model's Fourier coordinate scaffold. The previous 16×16 grouped ERF is shown only as a qualitative reference.</p>
 <p class="intro"><b>N={summary['n']}:</b> mean insertion AUC IxG/FRI {summary['ixg_auc_mean']:.3f}/{summary['fri_auc_mean']:.3f}; FRI AUC wins {summary['fri_auc_wins']}/{summary['n']}; mean k80 IxG/FRI {summary['ixg_k80_mean']:.0f}/{summary['fri_k80_mean']:.0f}; FRI smaller-k wins {summary['fri_k80_wins']}/{summary['n']}.</p>
 {cards}</main></body></html>"""
@@ -489,9 +489,9 @@ table{{margin-top:12px;border-collapse:collapse;background:#fff}}th,td{{padding:
     report = f"""# Perceiver native-pixel FRI smoke benchmark
 
 - N: {summary['n']}
-- Mean insertion AUC, IxG / FRI-16: {summary['ixg_auc_mean']:.4f} / {summary['fri_auc_mean']:.4f}
+- Mean insertion AUC, IxG / {fri_label}: {summary['ixg_auc_mean']:.4f} / {summary['fri_auc_mean']:.4f}
 - FRI AUC wins: {summary['fri_auc_wins']} / {summary['n']}
-- Mean pixel-k80 upper bound, IxG / FRI-16: {summary['ixg_k80_mean']:.1f} / {summary['fri_k80_mean']:.1f}
+- Mean pixel-k80 upper bound, IxG / {fri_label}: {summary['ixg_k80_mean']:.1f} / {summary['fri_k80_mean']:.1f}
 - FRI smaller-k wins: {summary['fri_k80_wins']} / {summary['n']}
 
 The k80 values are upper bounds at the configured rank-bucket granularity.
