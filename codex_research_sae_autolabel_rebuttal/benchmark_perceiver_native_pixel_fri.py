@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decile", type=int, default=0)
     parser.add_argument("--events-per-feature", type=int, default=1)
     parser.add_argument("--fri-steps", type=int, default=16)
+    parser.add_argument("--tv-multiplier", type=float, default=1.0)
+    parser.add_argument("--irrelevance-multiplier", type=float, default=1.0)
     parser.add_argument("--rank-bucket-size", type=int, default=256)
     parser.add_argument("--eval-batch-size", type=int, default=2)
     parser.add_argument("--threshold", type=float, default=0.80)
@@ -291,8 +293,14 @@ def run_render(args: argparse.Namespace) -> None:
                     init_score_prob_floor=0.05,
                     init_score_prob_ceiling=0.95,
                     reg_warmup_frac=0.20,
-                    tv_weight=0.01 * REGULARIZER_SCALE,
-                    irrelevance_weight=0.05 * REGULARIZER_SCALE,
+                    tv_weight=(
+                        0.01 * REGULARIZER_SCALE * float(args.tv_multiplier)
+                    ),
+                    irrelevance_weight=(
+                        0.05
+                        * REGULARIZER_SCALE
+                        * float(args.irrelevance_multiplier)
+                    ),
                     objective_mode="random_budget_softins",
                     random_budget_distribution="low",
                     score_mode="final_plus_grad",
@@ -385,6 +393,8 @@ def run_render(args: argparse.Namespace) -> None:
         "source_results": str(input_path),
         "part_name": args.part_name,
         "fri_steps": int(args.fri_steps),
+        "tv_multiplier": float(args.tv_multiplier),
+        "irrelevance_multiplier": float(args.irrelevance_multiplier),
         "rank_bucket_size": int(args.rank_bucket_size),
         "threshold": float(args.threshold),
         "records": output_rows,
